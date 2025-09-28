@@ -91,7 +91,7 @@ class Parameter:
 
 led_startup    = True
 led_effects    = []
-led_effect     = Parameter("Light_effect", 0, 3)
+led_effect     = Parameter("Light_effect", 0, 11)
 led_brightness = Parameter("Brightness", 10, 100)
 led_hue        = Parameter("Hue", 180, 360)
 led_sat        = Parameter("Saturation", 100, 100) # Defaulting to 100 as requested
@@ -1419,6 +1419,54 @@ def led_eff_spiral_spin(np, oldstate):
     return state
 
 
+def led_eff_olympic(np, oldstate):
+    """
+    Olympic rings effect - cycles through the 5 Olympic colors (blue, yellow, black, green, red)
+    with rotating sections around the ring.
+    """
+    state = oldstate or {"phase": 0.0}
+    n = len(np)
+    
+    # Olympic colors in HSV (hue values) - Blue, Yellow, Black, Green, Red
+    olympic_colors = [
+        240,  # Blue
+        60,   # Yellow  
+        0,    # Black (handled specially below)
+        120,  # Green
+        360   # Red (360 = 0 in HSV, but keeps array indexing clear)
+    ]
+    
+    # Each "ring" takes up 1/5 of the circle
+    ring_size = n / 5
+    s = led_sat.value / 100
+    v = led_brightness.value / 100
+    
+    for i in range(n):
+        # Determine which ring this LED belongs to (with rotation)
+        rotated_pos = (i + state["phase"]) % n
+        ring_index = int(rotated_pos / ring_size) % 5
+        
+        # Position within the ring (0.0 to 1.0)
+        ring_pos = (rotated_pos % ring_size) / ring_size
+        
+        # Create a brightness pulse within each ring
+        brightness_mult = 0.3 + 0.7 * (0.5 * (1 + math.sin(ring_pos * 2 * math.pi)))
+        
+        # Special handling for the "black" ring - use very dim white
+        if ring_index == 2:  # The "black" ring
+            np[i] = (int(v * brightness_mult * 50), int(v * brightness_mult * 50), int(v * brightness_mult * 50))
+        else:
+            hue = olympic_colors[ring_index] % 360  # Ensure hue wraps properly
+            np[i] = hsv_to_rgb(hue, s, v * brightness_mult)
+    
+    # Slow rotation based on speed parameter
+    state["phase"] += led_speed.value / 300.0
+    if state["phase"] >= n:
+        state["phase"] = 0
+    
+    return state
+
+
 def led_eff_police(np, oldstate):
     """
     Simulates police lights by flashing red and blue strobes on opposite sides.
@@ -1471,6 +1519,7 @@ async def neopixel_task(np):
                    ("Dual Hue", led_eff_dual_hue),        
                    ("Aurora", led_eff_aurora),
                    ("Spiral Spin", led_eff_spiral_spin),
+                   ("Olympic", led_eff_olympic),
                    ("Police", led_eff_police),
                    ("Cycle_All", led_eff_autocycle)]
 
