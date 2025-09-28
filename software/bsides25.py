@@ -666,8 +666,53 @@ class CodeRepoScreen(Screen):
 
         self.oled.show()
 
-badge_screens = [("Fetch Name", FetchNameScreen),
-                 ("Code git", CodeRepoScreen)]
+class WifiScanScreen(ListScreen):
+    def __init__(self, oled):
+        super().__init__(oled, "WiFi Networks", [("Scanning...", None)])
+        self.wlan = None
+        asyncio.create_task(self._scan_wifi())
+
+    async def _scan_wifi(self):
+        self.items = [("Scanning...", None)]
+        self.render()
+
+        if not self.wlan:
+            self.wlan = network.WLAN(network.STA_IF)
+        
+        self.wlan.active(True)
+        await asyncio.sleep_ms(100) # Allow it to initialize
+
+        try:
+            found_nets = self.wlan.scan()
+        except Exception as e:
+            self.items = [("Scan Error", None)]
+            self.render()
+            return
+        finally:
+            self.wlan.active(False)
+
+        if not found_nets:
+            self.items = [("No networks found", None)]
+        else:
+            found_nets.sort(key=lambda x: x[3], reverse=True) # Sort by RSSI
+            self.items = []
+            auth_map = {0: ' ', 1: 'W', 2: 'P', 3: 'P', 4: 'P'} # Open, WEP, WPA, WPA2, WPA/2
+            for ssid, _, _, rssi, authmode, _ in found_nets:
+                try:
+                    ssid_str = ssid.decode('utf-8', 'ignore')
+                except:
+                    ssid_str = "???"
+                auth_char = auth_map.get(authmode, '?')
+                self.items.append((f"{auth_char} {ssid_str[:15]}", rssi))
+
+        self.index = 0
+        self.offset = 0
+        self.render()
+
+    def on_back(self):
+        return BadgeScreen(self.oled)
+
+badge_screens = [("Fetch Name", FetchNameScreen), ("Scan WiFi", WifiScanScreen), ("Code git", CodeRepoScreen)]
 
 class BadgeScreen(ListScreen):
     def __init__(self, oled):
