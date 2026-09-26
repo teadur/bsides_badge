@@ -364,18 +364,33 @@ lines and gravity speeds up with it. The high score is stored as
 
 ### Pong link
 
-Pong uses UART1 on GPIO20/GPIO21. Cross-connect TX to RX in both directions and
-connect GND between badges:
+Pong works over Wi-Fi (ESP-NOW), or over the same cable as Tic-tac-toe: TX to
+RX in both directions plus GND (Badge A TX/pin 28 -> Badge B RX/pin 27, Badge
+B TX/pin 28 -> Badge A RX/pin 27, GND -> GND).
 
-- Badge A TX (pin 28) -> Badge B RX (pin 27)
-- Badge B TX (pin 28) -> Badge A RX (pin 27)
-- Badge A GND -> Badge B GND
+Open Pong on both badges. Each badge starts in the same kind of lobby as
+Tic-tac-toe: NEXT and PREV pick a player and SELECT invites them, an invited
+badge accepts with SELECT or declines with NEXT/BACK, and badges joined by a
+cable pair straight away. See [Tic-tac-toe link](#tic-tac-toe-link) for the
+full lobby description; it is shared code (`software/badge_link.py`), so a
+room can hold any number of Pong and Tic-tac-toe games (and a mix of both) at
+once without them interfering.
 
-Open Pong on both badges. The higher device ID becomes host; after a three-second
-countdown, the match lasts 60 seconds. NEXT moves up, SELECT moves down, and
-BACK exits. Pong resumes pairing automatically after a link interruption;
-reconnection starts a new match. Both badges need the same current Pong version
-because UART packets now include a checksum.
+The higher device ID becomes host, plays on the left, and owns the ball,
+score and match timer; the other badge plays on the right. After a
+three-second countdown, the match lasts 60 seconds. NEXT moves your paddle
+up, SELECT moves it down; BACK exits; once the match ends, SELECT starts a
+rematch.
+
+The host repeats the whole match state (ball, both paddles, score, time left,
+and which match this is) a few times a second, and the guest repeats its
+paddle position and whether it wants a rematch the same way, so a dropped or
+duplicated message never desyncs the game - it just shows up again on the
+next heartbeat, a few tens of milliseconds later. If the badges lose each
+other (out of range, cable unplugged), the match pauses in place - the ball
+freezes, nothing is lost - and picks back up exactly where it left off once
+messages flow again; nothing is reset unless BACK or a genuine unpair sends
+a badge back to the lobby.
 
 ### Tic-tac-toe link
 
@@ -428,8 +443,9 @@ per link) is ignored rather than applied twice. A badge whose ESP-NOW
 bring-up fails (older firmware, radio issue) still plays over the cable.
 
 The lobby and pairing live in `software/badge_link.py` (`PeerLink`), so other
-two-player games can use them. Frames are `<game prefix><body>*<checksum>`,
-one per ESP-NOW message or cable line. The bodies are:
+two-player games can use them; Tic-tac-toe (game prefix `T`) and Pong (`Q`)
+both do. Frames are `<game prefix><body>*<checksum>`, one per ESP-NOW message
+or cable line. The bodies are:
 
 | Body | Meaning |
 | --- | --- |
@@ -450,8 +466,8 @@ frame sent or received on both the cable and the radio to the
 After a failed pairing, open **Utils -> WiFi neighbours** and press SELECT to
 see the log on the badge, or save it with `python scripts/badge.py logs`. A
 badge whose log has no `espnow up ch 1 mac ...` line has a radio or firmware
-problem, not a pairing problem. Set `DEBUG_LINK = False` once linking works on
-real hardware.
+problem, not a pairing problem. Set `DEBUG_LINK = False` in `tictactoe.py` or
+`pong.py` once linking works on real hardware.
 
 To test the Wi-Fi link on two uploaded badges without the cable, run the
 scripted game on both at the same time (replace the ports with yours):
@@ -467,7 +483,10 @@ with the higher device ID invites the other test badge and the other accepts,
 as players would. They then play one game in which both sides take the first
 empty cell. Other badges nearby do not disturb the test. Each prints lines starting
 with `TTT-WIFI <device ID>:` ending in `PASS` or `FAIL: <reason>`, plus the
-free memory before and after.
+free memory before and after. `tests/pong_wifi_pair_hardware.py` is the same
+idea for Pong: it pairs the same way, then lets one full match play out and
+prints `PONG-WIFI <device ID>:` lines, failing if the link is ever reported
+lost during the match.
 
 That test starts the game without the menu, which leaves Wi-Fi much more
 memory than a player has. `tests/tictactoe_menu_hardware.py`, run the same

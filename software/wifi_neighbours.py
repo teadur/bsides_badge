@@ -31,22 +31,27 @@ def beacon(device_id, name):
     return BEACON_TAG + ("%s,%s" % (device_id, name[:16])).encode()
 
 
+# badge_link game prefixes seen on this channel, and the label to show for
+# each: <prefix>: <name>. T<kind><fields>*<checksum> is the wire format.
+LINK_GAMES = {b"T": "ttt", b"Q": "pong"}
+
+
 def describe(msg):
     """Return (device_id, name, kind) for a received frame; unknowns are None."""
     try:
         if msg.startswith(BEACON_TAG):
             parts = msg[2:].decode().split(",", 1)
             return parts[0], parts[1] if len(parts) > 1 else "", "beacon"
-        if msg.startswith(b"T") and len(msg) > 1:
-            # tic-tac-toe (badge_link): T<kind><fields>*<checksum>
+        name = LINK_GAMES.get(msg[0:1])
+        if name and len(msg) > 1:
             kind, fields = chr(msg[1]), msg[2:].split(b"*", 1)[0]
             if kind == "A":         # lobby advert: <id>,<name>
                 parts = fields.decode().split(",", 1)
                 return parts[0], parts[1] if len(parts) > 1 else "", \
-                    "ttt lobby"
+                    name + " lobby"
             if kind in "IKN":       # invite, accept, decline: <from>,<to>...
-                return fields.split(b",", 1)[0].decode(), None, "ttt " + kind
-            return None, None, "ttt " + kind
+                return fields.split(b",", 1)[0].decode(), None, name + " " + kind
+            return None, None, name + " " + kind
     except UnicodeError:
         pass
     return None, None, "unknown"

@@ -2,8 +2,9 @@
 
     mpremote connect COM14 run tests/pong_hardware_smoke.py
 
-The peer paddle heartbeat is injected in memory; no second badge is required.
-This checks the real OLED, scheduler, and UART driver but not cable quality.
+The peer's paddle heartbeat is injected directly into the game (bypassing
+the lobby and the link entirely); no second badge is required. This checks
+the real OLED, scheduler, and physics loop, but not the link itself.
 """
 
 import gc
@@ -17,6 +18,8 @@ import ssd1306
 
 class BadgeStub:
     device_id = "FFFFFFFFFFFF"
+    BTN_NEXT, BTN_PREV, BTN_SELECT, BTN_BACK = 1, 2, 3, 4
+    GamesScreen = None
 
 
 class CountingOLED(ssd1306.SSD1306_I2C):
@@ -38,16 +41,15 @@ async def main():
     gc.collect()
     start_free = gc.mem_free()
     game = pong.PongScreen(oled)
-    game.linked = True
-    game.is_host = True
-    game.got_peer = True
+    game.is_host = True                 # no partner: drive the game directly
+    game.match_no = 1
     game.phase = "play"
     game.play_start = time.ticks_ms()
     game.last_rx = game.play_start
 
     try:
         for _ in range(125):
-            game._handle_line(b"P25")
+            game._on_client(game.match_no, 25, False)
             await asyncio.sleep_ms(200)
         elapsed = time.ticks_diff(time.ticks_ms(), game.play_start)
         gc.collect()

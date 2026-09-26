@@ -1,34 +1,38 @@
 import time
 import urandom
-import machine
 import uasyncio as asyncio
+
+import badge_link
+import bsides
+import linklog
 
 from writer.writer import Writer
 import writer.font6 as font6
 import writer.freesans20 as freesans20
 
-# Badge-to-badge link: hardware UART1 on the UART pads (chip pins 27/28 =
-# GPIO20/GPIO21 on the ESP32-C3). Cross-wire TX->RX between the two badges.
-UART_ID = 1
-UART_RX = 20
-UART_TX = 21
-UART_BAUD = 115200
+GAME_NAME = "Pong"
 
-# Button ids (same values as bsides)
-BTN_NEXT = 1
-BTN_PREV = 2
-BTN_SELECT = 3
-BTN_BACK = 4
+# Players pick each other in badge_link's lobby (over the radio, or the same
+# cable as Tic-tac-toe: TX to RX both ways plus GND); after that every
+# message goes to the partner over whichever of the two is up.
+#
+# Debug flag: log phase changes and raw traffic on both the cable and the
+# radio to linklog (serial console, Utils -> WiFi neighbours, and
+# /linklog.txt). Pairing and ESP-NOW errors are logged either way.
+DEBUG_LINK = True
+
+BTN_NEXT = bsides.BTN_NEXT
+BTN_PREV = bsides.BTN_PREV
+BTN_SELECT = bsides.BTN_SELECT
+BTN_BACK = bsides.BTN_BACK
 
 GAME_SECONDS = 60
 TICK_MS = 20          # physics tick
 RENDER_MS = 60        # about 16 fps on the 2025 badge
-STATE_MS = 100        # host state, independent of render timing
-PADDLE_MS = 200       # guest heartbeat, independent of loop iterations
-PADDLE_CHANGE_MS = 50  # cap traffic while a paddle button is held
-HELLO_MS = 300
+STATE_MS = 100        # host state heartbeat, independent of render timing
+CLIENT_MS = 200        # guest heartbeat, independent of loop iterations
+CLIENT_CHANGE_MS = 50  # cap traffic while a paddle button is held
 COUNTDOWN_MS = 3000
-LINK_TIMEOUT_MS = 10000
 LOST_TIMEOUT_MS = 3500
 
 PADDLE_W = 2
@@ -39,41 +43,31 @@ BALL_SPEED0 = 1.0
 BALL_ACCEL = 0.15
 BALL_SPEED_MAX = 2.4
 
-GAME_NAME = "Pong"
-
-
-def frame(payload):
-    """Mark Pong traffic and reject truncated or corrupted UART lines."""
-    data = b"Q" + payload
-    check = 0
-    for value in data:
-        check ^= value
-    return data + b"*%02X\n" % check
-
-
-def unframe(line):
-    if len(line) < 5 or line[:1] != b"Q" or line[-3:-2] != b"*":
-        return None
-    try:
-        expected = int(line[-2:], 16)
-    except ValueError:
-        return None
-    check = 0
-    for value in line[:-3]:
-        check ^= value
-    return line[1:-3] if check == expected else None
+# S carries the host's phase as one of these letters; C is sent by the guest.
+PHASE_LETTER = {"count": "C", "play": "P", "over": "O"}
+LETTER_PHASE = {v: k for k, v in PHASE_LETTER.items()}
 
 
 class PongScreen:
     """
-    Two-player Pong over the UART link. The badge with the higher device ID
-    becomes host: it simulates ball, scores and match timer, and streams state
-    to the guest. The guest renders a mirrored view and streams its paddle
-    position back. Each player sees their own paddle on the left.
+    Two-player Pong. Players pair in badge_link's lobby, then play over the
+    cable and the radio at once. The badge with the higher device ID becomes
+    host: it owns the ball, scores and match timer, and plays on the left.
+    The other badge plays on the right. Every message the host sends carries
+    the whole state (ball, both paddles, score, time left, and whose match
+    this is), and every message the guest sends carries its paddle and
+    whether it wants a rematch, so a lost or duplicated message never
+    desyncs the game - it just shows up again on the next heartbeat, a few
+    tens of milliseconds later. A dropped link pauses the match in place
+    (the ball freezes; nothing is lost) and resumes it once messages flow
+    again, rather than forcing a new match.
     Controls:
-      NEXT/SELECT -> move paddle up/down (hold either to keep moving)
-      SELECT    -> rematch (when finished) / retry (on link error)
-      BACK      -> exit to menu
+      lobby      -> NEXT/PREV pick a player, SELECT invites; an invitation
+                    is accepted with SELECT, declined with NEXT or BACK
+      NEXT/SELECT -> move your paddle up/down (hold either to keep moving)
+      SELECT     -> rematch, once the match is over; back to the lobby
+                    when the link is lost
+      BACK       -> exit to menu
 
     The main UI sees manages_own_render and leaves rendering to the game loop.
     """
@@ -91,39 +85,25 @@ class PongScreen:
         self.pl_x = 2
         self.pr_x = oled.width - 2 - PADDLE_W
 
-        import bsides
         self.my_id = bsides.device_id
-
-        self.uart = machine.UART(UART_ID, baudrate=UART_BAUD,
-                                 tx=machine.Pin(UART_TX),
-                                 rx=machine.Pin(UART_RX), timeout=0,
-                                 rxbuf=1024)
+        self.link = badge_link.PeerLink(
+            b"Q", "pong", self.my_id, getattr(bsides, "USERNAME", None) or "",
+            on_paired=self._start_link, on_unpaired=self._on_unpaired,
+            on_message=self._handle_message, debug=DEBUG_LINK)
 
         self.running = True
-        self.phase = "link"          # link/count/play/over/nolink/lost
-        self.link_started = time.ticks_ms()
-        self.last_hello = time.ticks_add(self.link_started, -HELLO_MS)
-        self.linked = False
-        self.is_host = None
         self.peer_id = None
-        self.got_peer = False
+        self.is_host = None
+        self.match_no = 0
+        self._pre_lost_phase = "count"
 
-        self.score_l = 0             # host-frame scores (host = left)
-        self.score_r = 0
-        self.paddle_y = self._clamp_paddle((self.pf_bot - PADDLE_H) // 2)
-        self.op_y = self.paddle_y
-        self.bx = (oled.width - BALL) // 2
-        self.by = (self.pf_top + self.pf_bot - BALL) // 2
-        self.vx = 0.0
-        self.vy = 0.0
-        self.time_left = GAME_SECONDS
+        self._clear_scoreboard()
+        self._set_phase("lobby")
 
-        self.count_start = 0
-        self.play_start = 0
         self.last_rx = time.ticks_ms()
+        self.last_state_tx = self.last_rx
+        self.last_client_tx = self.last_rx
         self.last_sent_paddle = -1
-        self.last_paddle_tx = time.ticks_add(self.last_rx, -PADDLE_MS)
-        self.last_state_tx = time.ticks_add(self.last_rx, -STATE_MS)
         self.last_render = time.ticks_add(self.last_rx, -RENDER_MS)
         self._dirty = True
 
@@ -131,12 +111,30 @@ class PongScreen:
                        asyncio.create_task(self._rx())]
         self.render()
 
-    # ---------- helpers ----------
+    def _dbg(self, *parts):
+        if DEBUG_LINK:
+            linklog.log("pong", *parts)
+
+    def _set_phase(self, phase):
+        if phase != getattr(self, "phase", None):
+            self._dbg("phase", getattr(self, "phase", None), "->", phase)
+        self.phase = phase
+
+    # ---------- state helpers ----------
+    def _clear_scoreboard(self):
+        self.score_l = 0
+        self.score_r = 0
+        self.paddle_y = self._clamp_paddle((self.pf_bot - PADDLE_H) // 2)
+        self.op_y = self.paddle_y
+        self.bx = (self.oled.width - BALL) // 2
+        self.by = (self.pf_top + self.pf_bot - BALL) // 2
+        self.vx = 0.0
+        self.vy = 0.0
+        self.time_left = GAME_SECONDS
+        self.want_rematch = False
+
     def _clamp_paddle(self, y):
         return max(self.pf_top, min(self.pf_bot - PADDLE_H + 1, y))
-
-    def _send(self, msg):
-        self.uart.write(frame(msg))
 
     def _scores(self):
         if self.is_host:
@@ -151,34 +149,59 @@ class PongScreen:
         self.vx = BALL_SPEED0 * direction
         self.vy = (urandom.getrandbits(8) - 128) / 160.0
 
-    def _reset_match(self):
-        self.score_l = 0
-        self.score_r = 0
-        self.paddle_y = self._clamp_paddle((self.pf_bot - PADDLE_H) // 2)
-        self.op_y = self.paddle_y
-        self.vx = 0.0
-        self.vy = 0.0
-        self.time_left = GAME_SECONDS
-        self.bx = (self.oled.width - BALL) // 2
-        self.by = (self.pf_top + self.pf_bot - BALL) // 2
-
-    def _restart(self):
-        self._reset_match()
-        self.got_peer = False
-        self.phase = "count"
+    def _new_match(self):
+        """Host only: a fresh match, freshly numbered."""
+        self.match_no += 1
+        self._clear_scoreboard()
+        self._set_phase("count")
         self.count_start = time.ticks_ms()
-        self._send(b"G")
         self._dirty = True
 
-    async def _stop(self):
-        self.running = False
-        for t in self._tasks:
-            t.cancel()
-        await asyncio.sleep_ms(0)
-        try:
-            self.uart.deinit()
-        except Exception:
-            pass
+    # ---------- link ----------
+    def _start_link(self):
+        """Paired: the higher device ID hosts and starts the match; the
+        guest assumes a match is starting too, and the host's first state
+        heartbeat corrects it within about STATE_MS if it guessed wrong."""
+        peer = self.link.peer
+        now = time.ticks_ms()
+        self.last_rx = now
+        self.last_state_tx = time.ticks_add(now, -STATE_MS)
+        self.last_client_tx = time.ticks_add(now, -CLIENT_MS)
+        if peer.id == self.my_id:
+            self._set_phase("clash")
+            self._dirty = True
+            return
+        self.peer_id = peer.id
+        self.is_host = self.my_id > peer.id
+        if self.is_host:
+            self._new_match()
+        else:
+            self._clear_scoreboard()
+            self._set_phase("count")
+            self.count_start = now
+        self._dirty = True
+
+    def _on_unpaired(self, reason):
+        self.is_host = None
+        self.peer_id = None
+        self.match_no = 0
+        self._set_phase("lobby")
+        self._dirty = True
+
+    def _send(self, payload):
+        self.link.send(payload)
+
+    def _send_state(self):
+        self._send(("S%d,%s,%d,%d,%d,%d,%d,%d" % (
+            self.match_no, PHASE_LETTER[self.phase], int(self.bx), int(self.by),
+            self.paddle_y, self.score_l, self.score_r, self.time_left)).encode())
+        self.last_state_tx = time.ticks_ms()
+
+    def _send_client(self):
+        self._send(("C%d,%d,%d" % (
+            self.match_no, self.paddle_y, 1 if self.want_rematch else 0)).encode())
+        self.last_client_tx = time.ticks_ms()
+        self.last_sent_paddle = self.paddle_y
 
     # ---------- host physics ----------
     def _overlaps(self, py):
@@ -194,12 +217,7 @@ class PongScreen:
         self.time_left = GAME_SECONDS - time.ticks_diff(now, self.play_start) // 1000
         if self.time_left <= 0:
             self.time_left = 0
-            self.phase = "over"
-            self._send(b"E%d,%d" % (self.score_l, self.score_r))
-            self._dirty = True
-            return
-        if time.ticks_diff(now, self.last_rx) >= LOST_TIMEOUT_MS:
-            self.phase = "lost"
+            self._set_phase("over")
             self._dirty = True
             return
 
@@ -229,176 +247,117 @@ class PongScreen:
             self.score_l += 1
             self._serve(1)
 
-    def _send_state(self):
-        self._send(b"S%d,%d,%d,%d,%d,%d" % (int(self.bx), int(self.by),
-                   self.paddle_y, self.score_l, self.score_r, self.time_left))
+    # ---------- receive ----------
+    def _handle_message(self, payload):
+        tag = payload[0:1]
+        try:
+            parts = payload[1:].decode().split(",")
+            if tag == b"S":
+                self._on_state(int(parts[0]), parts[1], int(parts[2]),
+                               int(parts[3]), int(parts[4]), int(parts[5]),
+                               int(parts[6]), int(parts[7]))
+            elif tag == b"C":
+                self._on_client(int(parts[0]), int(parts[1]), parts[2] == "1")
+        except (ValueError, IndexError, UnicodeError) as exc:
+            self._dbg("dropped message:", payload, repr(exc))
 
-    # ---------- main loop ----------
+    def _on_state(self, match_no, phase_letter, bx, by, hy, sl, sr, t):
+        if self.is_host is not False:
+            return
+        new_phase = LETTER_PHASE.get(phase_letter)
+        if new_phase is None:
+            return
+        self.last_rx = time.ticks_ms()
+        if match_no != self.match_no:
+            self.match_no = match_no
+            self._clear_scoreboard()
+        self.op_y = self._clamp_paddle(hy)
+        self.bx = self.oled.width - bx - BALL
+        self.by = by
+        self.score_l, self.score_r = sl, sr
+        self.time_left = t
+        if new_phase != self.phase:
+            self._set_phase(new_phase)
+        self._dirty = True
+
+    def _on_client(self, match_no, paddle_y, rematch):
+        if self.is_host is not True:
+            return
+        self.last_rx = time.ticks_ms()
+        self.op_y = self._clamp_paddle(paddle_y)
+        if rematch and self.phase == "over" and match_no == self.match_no:
+            self._new_match()
+        self._dirty = True
+
+    # ---------- loops ----------
+    def _tick(self, now):
+        self.link.tick(now)
+        if self.link.dirty:
+            self.link.dirty = False
+            self._dirty = True
+        if self.phase in ("count", "play", "over", "lost"):
+            self._tick_match(now)
+        if self._dirty and (self.phase not in ("count", "play") or
+                            time.ticks_diff(now, self.last_render) >= RENDER_MS):
+            self.render()
+            self._dirty = False
+            self.last_render = now
+
+    def _tick_match(self, now):
+        lost = time.ticks_diff(now, self.last_rx) >= LOST_TIMEOUT_MS
+        if lost and self.phase != "lost":
+            self._pre_lost_phase = self.phase
+            self._set_phase("lost")
+            self._dirty = True
+        elif not lost and self.phase == "lost":
+            self._set_phase(self._pre_lost_phase)
+            self._dirty = True
+        if self.is_host:
+            if lost:
+                return                       # frozen: nothing to advance
+            if self.phase == "count":
+                if time.ticks_diff(now, self.count_start) >= COUNTDOWN_MS:
+                    self._set_phase("play")
+                    self.play_start = now
+                    self._serve()
+                    self._dirty = True
+            elif self.phase == "play":
+                self._physics(now)
+            if self.phase in ("count", "play", "over") and \
+                    time.ticks_diff(now, self.last_state_tx) >= STATE_MS:
+                self._send_state()
+        else:
+            due = time.ticks_diff(now, self.last_client_tx) >= CLIENT_MS
+            changed = self.paddle_y != self.last_sent_paddle and \
+                time.ticks_diff(now, self.last_client_tx) >= CLIENT_CHANGE_MS
+            if due or changed:
+                self._send_client()
+        if self.phase in ("count", "play") and \
+                time.ticks_diff(now, self.last_render) >= RENDER_MS:
+            self._dirty = True
+
     async def _loop(self):
         try:
             while self.running:
-                now = time.ticks_ms()
-                if self.phase in ("link", "nolink", "lost"):
-                    if time.ticks_diff(now, self.last_hello) >= HELLO_MS:
-                        self._send(b"H" + self.my_id.encode())
-                        self.last_hello = now
-                    if self.phase == "link" and \
-                            time.ticks_diff(now, self.link_started) >= LINK_TIMEOUT_MS:
-                        self.phase = "nolink"
-                        self._dirty = True
-                elif self.phase == "count":
-                    if self.is_host and not self.got_peer and \
-                            time.ticks_diff(now, self.last_hello) >= 500:
-                        self._send(b"G")
-                        self.last_hello = now
-                    if time.ticks_diff(now, self.count_start) >= COUNTDOWN_MS:
-                        self.phase = "play"
-                        self.play_start = now
-                        self.last_rx = now
-                        self.last_state_tx = time.ticks_add(now, -STATE_MS)
-                        self.last_paddle_tx = time.ticks_add(now, -PADDLE_MS)
-                        if self.is_host:
-                            self._serve()
-                        self._dirty = True
-                elif self.phase == "play":
-                    if self.is_host:
-                        self._physics(now)
-                        if self.phase == "play" and \
-                                time.ticks_diff(now, self.last_state_tx) >= STATE_MS:
-                            self._send_state()
-                            self.last_state_tx = now
-                    else:
-                        if time.ticks_diff(now, self.last_rx) >= LOST_TIMEOUT_MS:
-                            self.phase = "lost"
-                            self._dirty = True
-                if self.phase in ("count", "play") and not self.is_host:
-                    if (self.paddle_y != self.last_sent_paddle and
-                            time.ticks_diff(now, self.last_paddle_tx) >= PADDLE_CHANGE_MS) or \
-                            time.ticks_diff(now, self.last_paddle_tx) >= PADDLE_MS:
-                        self._send(b"P%d" % self.paddle_y)
-                        self.last_sent_paddle = self.paddle_y
-                        self.last_paddle_tx = now
-                if self.phase in ("count", "play") and \
-                        time.ticks_diff(now, self.last_render) >= RENDER_MS:
-                    self._dirty = True
-                if self._dirty and (self.phase not in ("count", "play") or
-                                    time.ticks_diff(now, self.last_render) >= RENDER_MS):
-                    self.render()
-                    self._dirty = False
-                    self.last_render = now
+                self._tick(time.ticks_ms())
                 await asyncio.sleep_ms(TICK_MS)
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            print("Pong loop stopped:", exc)
-            raise
 
-    # ---------- UART receive ----------
     async def _rx(self):
-        buf = b""
         try:
             while self.running:
-                n = self.uart.any()
-                if n:
-                    buf += self.uart.read(n)
-                    i = buf.find(b"\n")
-                    while i >= 0:
-                        payload = unframe(buf[:i])
-                        if payload is not None:
-                            self._handle_line(payload)
-                        buf = buf[i + 1:]
-                        i = buf.find(b"\n")
-                    if len(buf) > 200:
-                        buf = buf[-64:]
-                await asyncio.sleep_ms(5)
+                self.link.poll(time.ticks_ms())
+                await asyncio.sleep_ms(10)
         except asyncio.CancelledError:
             return
-        except Exception as exc:
-            print("Pong receive stopped:", exc)
-            raise
 
-    def _handle_line(self, line):
-        if not line:
-            return
-        tag, rest = line[0:1], line[1:]
-        if tag == b"H":
-            try:
-                peer_id = rest.decode()
-                if len(peer_id) != 12:
-                    return
-                int(peer_id, 16)
-            except (UnicodeError, ValueError):
-                return
-            if peer_id == self.my_id or \
-                    (self.peer_id is not None and peer_id != self.peer_id):
-                return
-            if self.phase in ("link", "nolink", "lost") or \
-                    (self.phase == "play" and
-                     time.ticks_diff(time.ticks_ms(), self.play_start) > 1000):
-                # Reply before the host starts its countdown. Without this,
-                # the late-entering badge may only receive G, which it cannot
-                # accept until it has learned the host's ID from an H packet.
-                self._send(b"H" + self.my_id.encode())
-                self.linked = True
-                self.peer_id = peer_id
-                self.is_host = self.my_id > peer_id
-                self.phase = "link"
-                self.link_started = time.ticks_ms()
-                self.last_rx = self.link_started
-                if self.is_host:
-                    self._reset_match()
-                    self.got_peer = False
-                    self.phase = "count"
-                    self.count_start = time.ticks_ms()
-                    self._send(b"G")
-                self._dirty = True
-        elif tag == b"G":
-            if not self.is_host and self.linked and self.phase in ("link", "count", "over"):
-                self._reset_match()
-                self.phase = "count"
-                self.count_start = time.ticks_ms()
-                self._dirty = True
-        elif tag == b"P":
-            if self.is_host and self.phase in ("count", "play"):
-                try:
-                    self.op_y = self._clamp_paddle(int(rest))
-                except ValueError:
-                    pass
-                else:
-                    self.got_peer = True
-                    self.last_rx = time.ticks_ms()
-        elif tag == b"S":
-            if not self.is_host and self.phase in ("play", "over"):
-                self._apply_state(rest)
-        elif tag == b"E":
-            if not self.is_host and self.phase == "play":
-                try:
-                    l, r = rest.split(b",")
-                    self.score_l, self.score_r = int(l), int(r)
-                except ValueError:
-                    return
-                self.time_left = 0
-                self.phase = "over"
-                self.last_rx = time.ticks_ms()
-                self._dirty = True
-        elif tag == b"R":
-            if self.is_host and self.phase == "over":
-                self._restart()
-
-    def _apply_state(self, rest):
-        try:
-            parts = rest.split(b",")
-            bx, by = int(parts[0]), int(parts[1])
-            hy, sl, sr, t = int(parts[2]), int(parts[3]), int(parts[4]), int(parts[5])
-        except (ValueError, IndexError):
-            return
-        self.bx = self.oled.width - bx - BALL
-        self.by = by
-        self.op_y = self._clamp_paddle(hy)
-        self.score_l, self.score_r = sl, sr
-        self.time_left = t
-        self.last_rx = time.ticks_ms()
-        self._dirty = True
+    async def _stop(self):
+        self.running = False
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.sleep_ms(0)
+        self.link.close()
 
     # ---------- drawing ----------
     def _center6(self, text, y):
@@ -409,18 +368,16 @@ class PongScreen:
     def render(self):
         oled = self.oled
         oled.fill(0)
-        if self.phase == "link":
-            self._center6("PONG", 10)
-            self._center6("Linking..." if not self.linked else "Linked, wait...", 28)
-            self._center6("BACK=Exit", 50)
-        elif self.phase == "nolink":
-            self._center6("No peer found", 16)
-            self._center6("SELECT=Retry", 34)
+        if self.phase == "lobby":
+            self.link.render(oled, "PONG")
+        elif self.phase == "clash":
+            self._center6("Same badge ID", 16)
+            self._center6("on both badges", 30)
             self._center6("BACK=Exit", 48)
         elif self.phase == "lost":
             self._center6("Link lost", 16)
-            self._center6("SELECT=Retry", 34)
-            self._center6("BACK=Exit", 48)
+            self._center6("Reconnecting...", 32)
+            self._center6("SELECT=Lobby  BACK=Exit", 50)
         elif self.phase == "count":
             self._center6("PONG", 0)
             n = 3 - time.ticks_diff(time.ticks_ms(), self.count_start) // 1000
@@ -473,10 +430,16 @@ class PongScreen:
 
     # ---------- input ----------
     async def handle_button(self, btn):
+        if self.phase == "lobby" and self.link.handle_button(btn):
+            return self
         if btn == BTN_BACK:
             await self._stop()
-            import bsides
             return bsides.GamesScreen(self.oled)
+
+        if self.phase == "lost":
+            if btn == BTN_SELECT:
+                self.link.leave()
+            return self
         if self.phase in ("count", "play"):
             if btn == BTN_NEXT:
                 self.paddle_y = self._clamp_paddle(self.paddle_y - PADDLE_STEP)
@@ -485,17 +448,11 @@ class PongScreen:
                 self.paddle_y = self._clamp_paddle(self.paddle_y + PADDLE_STEP)
                 self._dirty = True
         elif self.phase == "over" and btn == BTN_SELECT:
-            self._send(b"R")
             if self.is_host:
-                self._restart()
-        elif self.phase in ("nolink", "lost") and btn == BTN_SELECT:
-            self.phase = "link"
-            self.linked = False
-            self.is_host = None
-            self.peer_id = None
-            self.link_started = time.ticks_ms()
-            self.last_hello = time.ticks_add(self.link_started, -HELLO_MS)
-            self._dirty = True
+                self._new_match()
+            else:
+                self.want_rematch = True
+                self._send_client()
         return self
 
 
