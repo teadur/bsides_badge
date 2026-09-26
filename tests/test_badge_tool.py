@@ -295,17 +295,19 @@ class HardwareDetectionTests(unittest.TestCase):
     @patch.object(badge_tool, "existing_config",
                   return_value={"badge_version": "2025", "device_id": "A" * 12})
     @patch.object(badge_tool, "maybe_check_firmware")
+    @patch.object(badge_tool, "wake_badge")
     @patch.object(badge_tool, "detect_port", return_value="/dev/ttyACM1")
     @patch.object(badge_tool, "ensure_tools")
     def test_upload_writes_the_detected_version(
-            self, _ensure, _detect, _check, _existing, _logos, upload_tree,
-            _print):
+            self, _ensure, _detect, wake, _check, _existing, _logos,
+            upload_tree, _print):
         args = badge_tool.build_parser().parse_args(["upload", "--no-git-info"])
         with patch.object(badge_tool, "probe_hardware", return_value="2026"):
             badge_tool.command_upload(args)
         config = upload_tree.call_args.args[1]
         self.assertEqual(config["badge_version"], "2026")
         self.assertEqual(config["device_id"], "A" * 12)
+        wake.assert_called_once_with("/dev/ttyACM1")
 
     @patch("builtins.print")
     @patch.object(badge_tool, "run")
@@ -321,6 +323,45 @@ class HardwareDetectionTests(unittest.TestCase):
                 self.assertRaises(badge_tool.BadgeToolError):
             badge_tool.command_flash(args)
         run.assert_not_called()
+
+
+def answer(stdout, returncode=0, stderr=""):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+@patch("builtins.print")
+@patch.object(badge_tool.time, "sleep")
+@patch.object(badge_tool, "tool_command", return_value=["esptool"])
+@patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+class WakeBadgeTests(unittest.TestCase):
+    """A badge stuck in a program times out every mpremote command until
+    it is reset; the tool resets it once by itself."""
+
+    def test_a_badge_that_answers_is_left_alone(self, *_mocks):
+        with patch.object(badge_tool, "run",
+                          return_value=answer("BADGE_OK\n")) as run:
+            badge_tool.wake_badge("/dev/ttyACM1")
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(run.call_args.args[0][:3],
+                         ["mpremote", "resume", "exec"])
+
+    def test_a_stuck_badge_is_reset_and_asked_again(self, *_mocks):
+        replies = [subprocess.TimeoutExpired("mpremote", 10),
+                   answer("Hard resetting via RTS pin...\n"),
+                   answer("BADGE_OK\n")]
+        with patch.object(badge_tool, "run", side_effect=replies) as run:
+            badge_tool.wake_badge("/dev/ttyACM1")
+        self.assertEqual(run.call_args_list[1].args[0],
+                         ["esptool", "--port", "/dev/ttyACM1", "chip-id"])
+        self.assertEqual(run.call_count, 3)
+
+    def test_a_badge_that_stays_silent_is_an_error(self, *_mocks):
+        replies = [subprocess.TimeoutExpired("mpremote", 10), answer(""),
+                   answer("", 1, "mpremote: could not enter raw repl")]
+        with patch.object(badge_tool, "run", side_effect=replies), \
+                self.assertRaises(badge_tool.BadgeToolError) as caught:
+            badge_tool.wake_badge("/dev/ttyACM1")
+        self.assertIn("even after a reset", str(caught.exception))
 
 
 HAVE_MPY_CROSS = badge_tool.tool_command("mpy-cross") is not None
@@ -521,6 +562,7 @@ class LogsCommandTests(unittest.TestCase):
                    Namespace(returncode=0, stdout="", stderr="")]
         args = badge_tool.build_parser().parse_args(["logs"] + list(argv))
         with patch.object(badge_tool, "ensure_tools"), \
+                patch.object(badge_tool, "wake_badge"), \
                 patch.object(badge_tool, "detect_port", return_value="COM10"), \
                 patch.object(badge_tool, "mpremote_prefix",
                              return_value=["mpremote"]), \

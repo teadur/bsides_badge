@@ -142,6 +142,18 @@ override the detection; the tool warns if that disagrees with the hardware.
 `flash` probes before erasing, so a badge without MicroPython (brand new or
 erased) needs `--badge-version`.
 
+`upload`, `flash`, `logs`, and `delete` all check the badge answers before
+doing anything else, and reset it once (over USB, like the reset button)
+if it does not. A badge stuck in a program that never reaches the
+MicroPython prompt (for example a hung Wi-Fi test) otherwise makes every
+mpremote command fail with a 20-second timeout ("failed to access" or
+"timed out"). If the badge still does not answer after that reset, the
+tool reports it rather than retrying forever: close other programs using
+the port, unplug and replug the badge, or hold SELECT while pressing reset,
+then try again. `python scripts/badge.py reset` (or `make reset`) does just
+the reset, without uploading or reading anything, to unstick a badge by
+itself.
+
 The `upload` command replaces the badge's entire `/logos` directory with the
 current sponsor set, so logos removed from the repository do not remain on the
 badge.

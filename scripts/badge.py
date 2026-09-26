@@ -165,6 +165,58 @@ def mpremote_error(result: subprocess.CompletedProcess[str]) -> str:
     return lines[-1].strip() if lines else "exit status {}".format(result.returncode)
 
 
+PING_CODE = "print('BADGE_OK')"
+PING_TIMEOUT = 10
+BOOT_WAIT = 20       # seconds for the port to come back after a reset
+
+
+def badge_answers(port: str | None) -> bool:
+    """True if MicroPython on the badge runs a command. resume keeps the
+    badge's RAM (the link log not yet on flash) instead of soft-resetting."""
+    try:
+        result = run(mpremote_prefix(port) + ["resume", "exec", PING_CODE],
+                     check=False, capture=True, timeout=PING_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print("The badge did not answer within {} seconds.".format(PING_TIMEOUT))
+        return False
+    if "BADGE_OK" in result.stdout:
+        return True
+    print("The badge did not answer: {}".format(mpremote_error(result)))
+    return False
+
+
+def hard_reset(port: str | None) -> None:
+    """Reset the chip through the USB serial line, as the reset button does."""
+    esptool = tool_command("esptool")
+    if esptool is None:
+        raise BadgeToolError("esptool is not installed or available on PATH.")
+    port_args = ["--port", port] if port else []
+    # chip-id connects, then esptool's default --after hard-resets the chip.
+    run(esptool + port_args + ["chip-id"], check=False, capture=True,
+        timeout=30)
+    deadline = time.monotonic() + BOOT_WAIT
+    while port and not Path(port).exists() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    time.sleep(3)    # boot.py and main.py start; mpremote interrupts them
+
+
+def wake_badge(port: str | None) -> None:
+    """Make sure the badge answers, resetting it once if it does not.
+
+    A badge busy in a stuck program can hold the serial port open without
+    ever reaching the MicroPython prompt, and every mpremote command then
+    times out."""
+    if badge_answers(port):
+        return
+    print("Resetting the badge on {} and trying again.".format(port or "auto"))
+    hard_reset(port)
+    if not badge_answers(port):
+        raise BadgeToolError(
+            "The badge on {} does not answer, even after a reset. Close other "
+            "programs using the port, unplug and replug the badge, or hold "
+            "SELECT while pressing reset, then retry.".format(port or "auto"))
+
+
 def remote_read(port: str | None, filename: str) -> str:
     result = run(mpremote_prefix(port) + ["fs", "cat", ":/" + filename],
                  check=False, capture=True, timeout=20)
@@ -571,6 +623,7 @@ def upload_tools(args: argparse.Namespace) -> tuple[str, ...]:
 def command_upload(args: argparse.Namespace) -> str | None:
     ensure_tools(install=False, tools=upload_tools(args))
     port = detect_port(args.port)
+    wake_badge(port)
     maybe_check_firmware(port, args.skip_version_check)
     remote = existing_config(port, args.wipe)
     version = detect_badge_version(args, port, remote)
@@ -604,6 +657,7 @@ def command_flash(args: argparse.Namespace) -> str | None:
 def command_delete(args: argparse.Namespace) -> str | None:
     ensure_tools(install=False)
     port = detect_port(args.port)
+    wake_badge(port)
     config = read_remote_config(port)
     battery_line = battery_voltage_line(port, config)
     code = """import os
@@ -633,6 +687,7 @@ print('BADGE_DELETE_OK')
 def command_name(args: argparse.Namespace) -> str | None:
     ensure_tools(install=False)
     port = detect_port(args.port)
+    wake_badge(port)
     maybe_check_firmware(port, args.skip_version_check)
     remote = read_remote_config(port)
     if not remote and not args.badge_version:
@@ -697,9 +752,20 @@ def parse_log_dump(stdout: str) -> tuple[str | None, str]:
     return (match.group(1).upper() if match else None), log
 
 
+def command_reset(args: argparse.Namespace) -> None:
+    ensure_tools(install=False)
+    port = detect_port(args.port)
+    hard_reset(port)
+    if not badge_answers(port):
+        raise BadgeToolError("The badge on {} does not answer after the "
+                             "reset.".format(port or "auto"))
+    print("The badge on {} answers.".format(port or "auto"))
+
+
 def command_logs(args: argparse.Namespace) -> None:
     ensure_tools(install=False)
     port = detect_port(args.port)
+    wake_badge(port)
     result = run(mpremote_prefix(port) + ["resume", "exec", DUMP_LOG_CODE],
                  check=False, capture=True, timeout=60)
     if result.returncode != 0:
@@ -780,6 +846,11 @@ def build_parser() -> argparse.ArgumentParser:
     name.add_argument("--skip-version-check", action="store_true")
     name.add_argument("--no-git-info", action="store_true")
     name.set_defaults(handler=command_name)
+
+    reset = subparsers.add_parser(
+        "reset", help="hard-reset the badge, e.g. when it stops answering")
+    add_connection_options(reset)
+    reset.set_defaults(handler=command_reset)
 
     logs = subparsers.add_parser(
         "logs", help="save the Wi-Fi link debug log from the badge")

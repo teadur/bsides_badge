@@ -24,7 +24,7 @@ CLEAR_ARG = $(if $(CLEAR),--clear)
 COMPILE_ARG = $(if $(NO_COMPILE),--no-compile)
 
 .DEFAULT_GOAL := help
-.PHONY: help tools upload logs wifi-test menu-test badge-test report wifi-check test
+.PHONY: help tools upload reset logs wifi-test menu-test badge-test report wifi-check test
 
 help:
 	@echo "Targets (PORTS=\"$(PORTS)\"):"
@@ -37,6 +37,8 @@ help:
 	@echo "  wifi-check  upload, then badge-test"
 	@echo "  wifi-test   only the test that starts tic-tac-toe directly"
 	@echo "  menu-test   only the test that opens it from the menu"
+	@echo "  reset       hard-reset every badge (upload and logs do it by"
+	@echo "              themselves when a badge stops answering)"
 	@echo "  logs        only save each badge's link log to $(LOG_DIR)/"
 	@echo "              (CLEAR=1 also deletes it on the badge)"
 	@echo "  report      bundle the files of the last badge-test run again"
@@ -49,6 +51,12 @@ upload:
 	@set -e; for port in $(PORTS); do \
 		echo "=== upload $$port"; \
 		$(BADGE) upload --port $$port $(VERSION_ARG) $(COMPILE_ARG); \
+	done
+
+reset:
+	@set -e; for port in $(PORTS); do \
+		echo "=== reset $$port"; \
+		$(BADGE) reset --port $$port; \
 	done
 
 logs:
