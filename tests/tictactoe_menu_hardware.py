@@ -6,9 +6,11 @@
 tictactoe_wifi_pair_hardware.py starts the game by itself. This test instead
 starts the normal application (main.py, which loads the whole menu UI: the
 state in which Wi-Fi ran out of memory) and drives it with simulated button
-presses, Games -> Tic-tac-toe, then plays the same scripted game: each side
-takes the first empty cell on its turn, so the board must end XOXOXOX-- won
-by X. The cable receiver is ignored, so every frame has to come over Wi-Fi.
+presses, Games -> Tic-tac-toe. In the lobby, the badge with the higher ID
+picks the other test badge (both go by the name TEST_NAME) and invites it,
+the other accepts. Then they play the same scripted game: each side takes
+the first empty cell on its turn, so the board must end XOXOXOX-- won by X.
+The cable is ignored, so every frame has to come over Wi-Fi.
 Each badge prints MENU-TEST <id>: PASS or FAIL; the same lines go to its
 link log.
 """
@@ -19,9 +21,10 @@ import time
 import uasyncio as asyncio
 
 STEP_MS = 250            # lets the UI handle one press before the next
-LINK_TIMEOUT_MS = 40000
+LINK_TIMEOUT_MS = 45000  # room for one unanswered invitation
 GAME_TIMEOUT_MS = 60000
 EXPECTED = "XOXOXOX--"
+TEST_NAME = "ttt-menu-test"
 
 
 class Finished(Exception):
@@ -32,12 +35,18 @@ class MenuDriver:
     """Presses buttons through bsides' own UI loop, like a player would."""
 
     async def run(self):
+        import badge_link
         import bsides
         import espnow_link
+        import game_loader
         import linklog
         self.ui = bsides
         self.linklog = linklog
         self.espnow_link = espnow_link
+        # Wi-Fi only, even with a cable; kept loaded so the game sees it.
+        badge_link.CABLE = False
+        game_loader.GAME_HELPERS.remove("badge_link")
+        holder, bsides.USERNAME = bsides.USERNAME, TEST_NAME
         try:
             await asyncio.sleep_ms(500)
             game = await self.open_game()
@@ -46,6 +55,9 @@ class MenuDriver:
         except Exception as exc:
             self.say("FAIL: %s" % exc)
         await self.leave_game()
+        bsides.USERNAME = holder
+        badge_link.CABLE = True
+        game_loader.GAME_HELPERS.append("badge_link")
         self.say("after leaving the game, " + self.memory())
         linklog.flush()
         raise Finished()
@@ -90,21 +102,46 @@ class MenuDriver:
         if type(game).__name__ != "TicTacToeScreen":
             raise RuntimeError("Tic-tac-toe did not open")
         self.say("game loaded from " + sys.modules["games.tictactoe"].__file__)
-        game._poll_uart = lambda: None      # Wi-Fi only, even with a cable
-        if game.espnow is None:
+        if game.link.esp is None:
             raise RuntimeError("ESP-NOW did not start; see the link log")
         return game
+
+    async def pair(self, game, start):
+        """Invite the other test badge from the lobby list, or accept it."""
+        link = game.link
+        while game.phase != "play" or not game.game_no:
+            if time.ticks_diff(time.ticks_ms(), start) > LINK_TIMEOUT_MS:
+                raise RuntimeError("no link within %d ms (phase %s, lobby %s)"
+                                   % (LINK_TIMEOUT_MS, game.phase, link.state))
+            if link.state == "lobby":
+                ids = [p.id for p in link.listed()
+                       if p.name == TEST_NAME and p.id < link.my_id]
+                if ids:
+                    await self.invite(link, ids[0])
+            elif link.state == "invited":
+                inviter = link.players.get(link.target)
+                if inviter is not None and inviter.name == TEST_NAME:
+                    self.say("accepting " + inviter.id)
+                    await self.press(self.ui.BTN_SELECT)
+                else:
+                    await self.press(self.ui.BTN_NEXT)      # "NEXT=no"
+            await asyncio.sleep_ms(100)
+
+    async def invite(self, link, device_id):
+        """Scroll the lobby list to device_id with NEXT, then SELECT."""
+        for _ in range(len(link.listed())):
+            players = link.listed()
+            if link.index < len(players) and \
+                    players[link.index].id == device_id:
+                self.say("inviting " + device_id)
+                await self.press(self.ui.BTN_SELECT)
+                return
+            await self.press(self.ui.BTN_NEXT)
 
     async def play(self, game):
         ttt = sys.modules["games.tictactoe"]
         start = time.ticks_ms()
-        while game.phase != "play" or not game.game_no:
-            if time.ticks_diff(time.ticks_ms(), start) > LINK_TIMEOUT_MS:
-                raise RuntimeError("no link within %d ms (phase %s)" % (
-                    LINK_TIMEOUT_MS, game.phase))
-            if game.phase == "nolink":
-                await self.press(self.ui.BTN_SELECT)    # "SELECT=Retry"
-            await asyncio.sleep_ms(100)
+        await self.pair(game, start)
         self.say("linked in %d ms as %s (%s), peer %s" % (
             time.ticks_diff(time.ticks_ms(), start), game.my_mark(),
             "host" if game.is_host else "guest", game.peer_id))

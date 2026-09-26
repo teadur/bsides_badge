@@ -2,11 +2,14 @@ import asyncio
 import importlib.util
 import random
 import sys
-import tempfile
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import link_fakes  # noqa: E402
+from link_fakes import Air, Clock as _Clock  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -47,105 +50,6 @@ class _Task:
         pass
 
 
-class _Clock:
-    now = 100000
-
-    @classmethod
-    def ticks_ms(cls):
-        return cls.now
-
-    @staticmethod
-    def ticks_diff(a, b):
-        return a - b
-
-    @staticmethod
-    def ticks_add(a, b):
-        return a + b
-
-
-class FakeUart:
-    """One end of a cable. Lines written here arrive at .peer, unless the
-    cable is unplugged or the lossy filter drops or corrupts them."""
-
-    def __init__(self, *_args, **_kwargs):
-        self.rx = b""
-        self.peer = None
-        self.plugged = True
-        self.loss = 0.0
-        self.sent = []
-        self.closed = False
-
-    def write(self, data):
-        self.sent.append(data)
-        if not self.peer or not self.plugged or not self.peer.plugged:
-            return
-        roll = random.random()
-        if roll < self.loss:
-            return
-        if roll < self.loss * 1.5:
-            data = bytes([data[0], data[1] ^ 0x01]) + data[2:]   # bit flip
-        self.peer.rx += data
-
-    def any(self):
-        return len(self.rx)
-
-    def read(self, n):
-        data, self.rx = self.rx[:n], self.rx[n:]
-        return data
-
-    def deinit(self):
-        self.closed = True
-
-
-class FakeEspNow:
-    """One badge's broadcast ESP-NOW radio. Messages sent here arrive in
-    .peer's inbox, unless the radio is inactive or has no peer in range."""
-
-    def __init__(self, *_args, **_kwargs):
-        self.active_ = False
-        self.peers = set()
-        self.inbox = []
-        self.peer = None
-        self.sent = []
-
-    def active(self, value=None):
-        if value is None:
-            return self.active_
-        self.active_ = value
-
-    def add_peer(self, mac):
-        self.peers.add(mac)
-
-    def send(self, mac, msg, sync=True):
-        self.sent.append(msg)
-        if self.peer is not None and self.active_ and self.peer.active_:
-            self.peer.inbox.append((b"\x11" * 6, bytes(msg)))
-
-    def recv(self, _timeout_ms=0):
-        if self.inbox:
-            return self.inbox.pop(0)
-        return (None, None)
-
-
-class FakeWLAN:
-    def __init__(self, *_args, **_kwargs):
-        self.channel = None
-
-    def active(self, _value=None):
-        return True
-
-    def disconnect(self):
-        pass
-
-    def config(self, *args, **kwargs):
-        if kwargs:
-            self.channel = kwargs.get("channel", self.channel)
-            return None
-        if args and args[0] == "mac":
-            return b"\x02\x00\x00\x00\x00\x01"
-        return None
-
-
 async def _sleep_ms(_ms):
     return None
 
@@ -159,46 +63,13 @@ def _install_stubs():
     bsides.GamesScreen = lambda oled: "games"
     sys.modules["bsides"] = bsides
 
-    machine = types.ModuleType("machine")
-    machine.UART = FakeUart
-    machine.Pin = lambda *args, **kwargs: None
-    sys.modules["machine"] = machine
-
-    network = types.ModuleType("network")
-    network.WLAN = FakeWLAN
-    network.STA_IF = 0
-    sys.modules["network"] = network
-
-    espnow_module = types.ModuleType("espnow")
-    espnow_module.ESPNow = FakeEspNow
-    sys.modules["espnow"] = espnow_module
-
     uasyncio = types.ModuleType("uasyncio")
     uasyncio.create_task = lambda coro: (coro.close(), _Task())[1]
     uasyncio.sleep_ms = _sleep_ms
     uasyncio.CancelledError = Exception
     sys.modules["uasyncio"] = uasyncio
 
-    sys.modules.setdefault(
-        "urandom", types.SimpleNamespace(getrandbits=lambda bits: random.getrandbits(bits)))
-    time_stub = types.ModuleType("time")
-    time_stub.ticks_ms = _Clock.ticks_ms
-    time_stub.ticks_diff = _Clock.ticks_diff
-    time_stub.ticks_add = _Clock.ticks_add
-    sys.modules["time"] = time_stub
-
-    for name in ("linklog", "espnow_link"):
-        spec = importlib.util.spec_from_file_location(
-            name, ROOT / "software" / (name + ".py"))
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-    log_dir = Path(tempfile.mkdtemp(prefix="ttt-linklog-"))
-    sys.modules["linklog"].LOG_PATH = str(log_dir / "linklog.txt")
-    sys.modules["linklog"].OLD_PATH = str(log_dir / "linklog.old.txt")
-    sys.modules["linklog"].print = lambda *args, **kwargs: None
-    sys.modules["espnow_link"].gc = types.SimpleNamespace(
-        collect=lambda: None, mem_free=lambda: 123456)
+    link_fakes.install()
 
 
 _install_stubs()
@@ -207,7 +78,8 @@ SPEC = importlib.util.spec_from_file_location(
 ttt = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(ttt)
-sys.modules["time"] = __import__("time")  # restore for unittest
+link_fakes.restore()
+badge_link = ttt.badge_link
 
 BTN_NEXT, BTN_PREV, BTN_SELECT, BTN_BACK = 1, 2, 3, 4
 HIGH_ID, LOW_ID = "FFFF00000001", "0000AAAA0002"
@@ -219,24 +91,37 @@ def make(device_id):
 
 
 def wire(a, b):
-    a.uart.peer, b.uart.peer = b.uart, a.uart
+    """Plug a cable between two badges."""
+    link_fakes.wire(a.link.uart, b.link.uart)
 
 
 def wire_espnow(a, b):
-    a.espnow.peer, b.espnow.peer = b.espnow, a.espnow
+    """Put two badges' radios in range of each other (and nobody else)."""
+    Air().join(a.link.esp, b.link.esp)
 
 
 def pump(games, ms=600):
     for _ in range(ms // ttt.TICK_MS):
         _Clock.now += ttt.TICK_MS
         for g in games:
-            g._poll_links()
+            g.link.poll(_Clock.now)
             g._tick(_Clock.now)
 
 
 def press(game, btn):
     _Clock.now += ttt.MOVE_GUARD_MS
     return asyncio.run(game.handle_button(btn))
+
+
+def pair_radio(a, b):
+    """a invites b from the lobby, b accepts; then they start a game."""
+    pump([a, b], 1500)
+    a.link.index = [p.id for p in a.link.listed()].index(b.my_id)
+    press(a, BTN_SELECT)
+    pump([a, b], 600)
+    assert b.link.state == "invited", b.link.state
+    press(b, BTN_SELECT)
+    pump([a, b], 1000)
 
 
 def play_cell(game, cell, others):
@@ -250,6 +135,12 @@ def play_cell(game, cell, others):
     pump([game] + others)
 
 
+def game_messages(uart):
+    """Game messages (after the session code) a badge wrote to its cable."""
+    bodies = [badge_link.decode(b"T", line.rstrip(b"\n")) for line in uart.sent]
+    return [b[b.index(b",") + 1:] for b in bodies if b and b[0:1] == b"G"]
+
+
 class HelperTests(unittest.TestCase):
     def test_winner(self):
         self.assertEqual(ttt.winner(list("---------")), ("-", None))
@@ -261,18 +152,6 @@ class HelperTests(unittest.TestCase):
         # a full board with a winning line is a win, not a draw
         self.assertEqual(ttt.winner(list("XXXOOXXOO"))[0], "X")
 
-    def test_frames_roundtrip_and_reject_garbage(self):
-        line = ttt.encode(b"C12,4,7")
-        self.assertEqual(ttt.decode(line), b"C12,4,7")
-        self.assertIsNone(ttt.decode(line[:-1]))
-        self.assertIsNone(ttt.decode(line.replace(b",7", b",8")))
-        self.assertIsNone(ttt.decode(b""))
-        self.assertIsNone(ttt.decode(b"T*00"))
-        self.assertIsNone(ttt.decode(b"TC1,1,1*ZZ"))
-        # Pong traffic on the same cable must never parse
-        for pong in (b"HFFFF00000001", b"G", b"P23", b"S60,30,20,1,2,45", b"R"):
-            self.assertIsNone(ttt.decode(pong))
-
 
 class LinkedGameTests(unittest.TestCase):
     def setUp(self):
@@ -282,7 +161,7 @@ class LinkedGameTests(unittest.TestCase):
         self.guest = make(LOW_ID)
         wire(self.host, self.guest)
         self.both = [self.host, self.guest]
-        pump(self.both)
+        pump(self.both, 2000)           # the cable pairs them by itself
 
     def assert_in_sync(self):
         self.assertEqual(self.host.board, self.guest.board)
@@ -300,11 +179,12 @@ class LinkedGameTests(unittest.TestCase):
 
     def test_handshake_does_not_echo_forever(self):
         for g in self.both:
-            g.uart.sent.clear()
+            g.link.uart.sent.clear()
         pump(self.both, 3000)
         for g in self.both:
-            hellos = [m for m in g.uart.sent if m.startswith(b"TH")]
-            self.assertEqual(hellos, [])
+            messages = game_messages(g.link.uart)
+            self.assertTrue(messages)
+            self.assertEqual([m for m in messages if m.startswith(b"H")], [])
 
     def test_full_game_host_wins(self):
         h, g = self.host, self.guest
@@ -368,7 +248,7 @@ class LinkedGameTests(unittest.TestCase):
 
     def test_game_survives_a_lossy_corrupting_link(self):
         h, g = self.host, self.guest
-        h.uart.loss = g.uart.loss = 0.5
+        h.link.uart.loss = g.link.uart.loss = 0.5
         moves = ((h, 4), (g, 0), (h, 8), (g, 2), (h, 1), (g, 7), (h, 3), (g, 5), (h, 6))
         for who, cell in moves:
             mark = who.my_mark()
@@ -387,15 +267,21 @@ class LinkedGameTests(unittest.TestCase):
         self.assert_in_sync()
         self.assertEqual(ttt.winner(h.board)[0], "D")
         self.assertEqual((h.draws, g.draws), (1, 1))
+        # Half the traffic is lost, so a 2 s gap (a moment of "lost") can
+        # happen; the link must always come back.
+        for _ in range(20):
+            if (h.phase, g.phase) == ("play", "play"):
+                break
+            pump(self.both, 250)
         self.assertEqual((h.phase, g.phase), ("play", "play"))
 
     def test_unplugged_cable_is_detected_and_game_resumes(self):
         h, g = self.host, self.guest
         play_cell(h, 4, [g])
-        h.uart.plugged = False
+        h.link.uart.plugged = False
         pump(self.both, ttt.LOST_TIMEOUT_MS + 500)
         self.assertEqual((h.phase, g.phase), ("lost", "lost"))
-        h.uart.plugged = True
+        h.link.uart.plugged = True
         pump(self.both, 1500)
         self.assertEqual((h.phase, g.phase), ("play", "play"))
         self.assertEqual(h.board[4], "X")
@@ -410,7 +296,7 @@ class LinkedGameTests(unittest.TestCase):
         asyncio.run(self.guest.handle_button(BTN_BACK))
         guest2 = make(LOW_ID)
         wire(h, guest2)
-        pump([h, guest2], 1500)
+        pump([h, guest2], 2500)
         self.assertEqual(guest2.phase, "play")
         self.assertEqual(guest2.board, h.board)
         self.assertEqual(guest2.board[4], "X")
@@ -428,7 +314,7 @@ class LinkedGameTests(unittest.TestCase):
         stale_game = g.game_no
         same_base = (stale_game - 1) // 2 - 1
         with patch.object(ttt.urandom, "getrandbits", lambda bits: same_base):
-            pump([host2, g], 1500)
+            pump([host2, g], 2500)
         self.assertEqual(host2.game_no, stale_game)
         self.assertEqual((host2.phase, g.phase), ("play", "play"))
         self.assertEqual(g.game_no, host2.game_no)
@@ -444,7 +330,7 @@ class LinkedGameTests(unittest.TestCase):
             attempts.append(_Clock.now)
             raise OSError(-12391, "ESP_ERR_ESPNOW_NO_MEM")
 
-        h.espnow.send = no_memory
+        h.link.esp.send = no_memory
         play_cell(h, 4, [g])
         pump(self.both, 12000)
         # The heartbeat alone would try about 48 sends in 12 s.
@@ -457,13 +343,16 @@ class LinkedGameTests(unittest.TestCase):
     def test_back_releases_the_uart(self):
         self.assertEqual(press(self.host, BTN_BACK), "games")
         self.assertFalse(self.host.running)
-        self.assertTrue(self.host.uart.closed)
-        self.assertFalse(self.host.espnow.active_)
+        self.assertTrue(self.host.link.uart.closed)
+        self.assertFalse(self.host.link.esp.active_)
+        # and the guest is told, rather than waiting for a timeout
+        pump([self.guest], 200)
+        self.assertEqual(self.guest.phase, "lobby")
 
 
 class EspNowLinkTests(unittest.TestCase):
-    """Same protocol, but with no cable at all: only the broadcast ESP-NOW
-    radios are wired together."""
+    """Same protocol, but with no cable at all: the players pair in the
+    lobby over the radio."""
 
     def setUp(self):
         random.seed(3)
@@ -472,7 +361,7 @@ class EspNowLinkTests(unittest.TestCase):
         self.guest = make(LOW_ID)
         wire_espnow(self.host, self.guest)
         self.both = [self.host, self.guest]
-        pump(self.both)
+        pair_radio(self.guest, self.host)
 
     def test_links_and_plays_without_a_cable(self):
         h, g = self.host, self.guest
@@ -486,21 +375,29 @@ class EspNowLinkTests(unittest.TestCase):
 
     def test_link_events_reach_the_persisted_link_log(self):
         ttt.linklog.flush()
-        text = Path(ttt.linklog.LOG_PATH).read_text()
-        self.assertIn("ttt espnow up ch 1 mac 02:00:00:00:00:01", text)
+        log = ttt.linklog
+        text = "".join(Path(path).read_text() for path in
+                       (log.OLD_PATH, log.LOG_PATH) if Path(path).exists())
+        mac = ttt.badge_link.espnow_link.mac_hex(
+            self.host.link.esp.mac)
+        self.assertIn("ttt espnow up ch 1 mac " + mac, text)
+        self.assertIn("ttt inviting " + HIGH_ID, text)
+        self.assertIn("ttt paired with " + LOW_ID, text)
+        self.assertIn("ttt phase lobby -> link", text)
         self.assertIn("ttt phase link -> play", text)
         self.assertIn("ttt hello from " + LOW_ID, text)
-        self.assertIn("ttt rx espnow(11:11:11:11:11:11) S", text)
+        self.assertIn(",S", text)
+        self.assertIn(" from " + mac, text)
 
     def test_falls_back_to_uart_when_espnow_is_unavailable(self):
         """No espnow module (older firmware, no Wi-Fi radio, ...) -> the
         cable-only path from before this feature still works unmodified."""
-        with patch.object(ttt.espnow_link, "espnow", None):
+        with patch.object(badge_link.espnow_link, "espnow", None):
             h, g = make(HIGH_ID), make(LOW_ID)
-        self.assertIsNone(h.espnow)
-        self.assertIsNone(g.espnow)
+        self.assertIsNone(h.link.esp)
+        self.assertIsNone(g.link.esp)
         wire(h, g)
-        pump([h, g])
+        pump([h, g], 2000)
         self.assertEqual((h.phase, g.phase), ("play", "play"))
         play_cell(h, 4, [g])
         self.assertEqual(g.board[4], "X")
@@ -522,41 +419,83 @@ class EspNowLinkTests(unittest.TestCase):
         self.assertEqual(h.board, g.board)
 
 
+class CrowdTests(unittest.TestCase):
+    """Two games in one room, with a fifth badge waiting in the lobby."""
+
+    def test_two_games_on_one_channel_stay_apart(self):
+        random.seed(5)
+        _Clock.now = 100000
+        room = Air(loss=0.1)
+        ids = ("F1" + "0" * 10, "A1" + "0" * 10, "F2" + "0" * 10,
+               "A2" + "0" * 10, "C3" + "0" * 10)
+        h1, g1, h2, g2, lone = badges = [make(i) for i in ids]
+        room.join(*(b.link.esp for b in badges))
+        room.loss = 0.0
+        pair_radio(g1, h1)
+        pair_radio(h2, g2)
+        room.loss = 0.1
+        pump(badges, 1000)
+        self.assertEqual([b.phase for b in badges], ["play"] * 4 + ["lobby"])
+        self.assertEqual((h1.peer_id, h2.peer_id), (ids[1], ids[3]))
+
+        for who, cell, other in ((h1, 0, g1), (h2, 8, g2), (g1, 4, h1),
+                                 (g2, 3, h2), (h1, 1, g1), (h2, 7, g2)):
+            play_cell(who, cell, [b for b in badges if b is not who])
+            pump(badges, 1000)
+        self.assertEqual("".join(h1.board), "XX--O----")
+        self.assertEqual("".join(h2.board), "---O---XX")
+        self.assertEqual(h1.board, g1.board)
+        self.assertEqual(h2.board, g2.board)
+        self.assertEqual(lone.phase, "lobby")
+
+
 class LonelyBadgeTests(unittest.TestCase):
     def setUp(self):
         _Clock.now = 100000
 
-    def test_no_peer_times_out_and_select_retries(self):
+    def test_waits_in_the_lobby_advertising(self):
         g = make(HIGH_ID)
-        pump([g], ttt.LINK_TIMEOUT_MS + 500)
-        self.assertEqual(g.phase, "nolink")
-        press(g, BTN_SELECT)
-        self.assertEqual(g.phase, "link")
+        pump([g], 5000)
+        self.assertEqual((g.phase, g.link.state), ("lobby", "lobby"))
+        adverts = [m for m in g.link.uart.sent if m.startswith(b"TA")]
+        self.assertGreaterEqual(len(adverts), 4)
+        press(g, BTN_SELECT)                # nobody listed: nothing happens
+        self.assertEqual(g.phase, "lobby")
 
-    def test_late_peer_links_after_timeout(self):
+    def test_late_peer_links(self):
         a = make(HIGH_ID)
-        pump([a], ttt.LINK_TIMEOUT_MS + 500)
+        pump([a], 12000)
         b = make(LOW_ID)
         wire(a, b)
-        pump([a, b], 1500)
+        pump([a, b], 2500)
         self.assertEqual((a.phase, b.phase), ("play", "play"))
         self.assertEqual(a.board, b.board)
 
     def test_identical_ids_are_reported(self):
         a, b = make(HIGH_ID), make(HIGH_ID)
         wire(a, b)
-        pump([a, b], 1500)
+        pump([a, b], 2500)
         self.assertEqual((a.phase, b.phase), ("clash", "clash"))
+
+    def test_lost_partner_select_returns_to_the_lobby(self):
+        a, b = make(HIGH_ID), make(LOW_ID)
+        wire(a, b)
+        pump([a, b], 2500)
+        a.link.uart.plugged = False
+        pump([a, b], ttt.LOST_TIMEOUT_MS + 500)
+        self.assertEqual(a.phase, "lost")
+        press(a, BTN_SELECT)
+        self.assertEqual((a.phase, a.link.state), ("lobby", "lobby"))
 
     def test_pong_on_the_other_end_is_ignored(self):
         g = make(HIGH_ID)
-        other = FakeUart()
-        g.uart.peer, other.peer = other, g.uart
+        other = link_fakes.FakeUart()
+        link_fakes.wire(g.link.uart, other)
         for _ in range(20):
             other.write(b"H0000AAAA0002\n")
             other.write(b"G\n")
             pump([g], 300)
-        self.assertIn(g.phase, ("link", "nolink"))
+        self.assertEqual(g.phase, "lobby")
         self.assertIsNone(g.is_host)
 
 

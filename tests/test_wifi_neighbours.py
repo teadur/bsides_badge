@@ -183,10 +183,12 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(nbr.describe(msg), (MY_ID, "Ada, Lovelace", "beacon"))
 
     def test_describes_tictactoe_traffic(self):
-        self.assertEqual(nbr.describe(b"THFFFF00000001,1,0*3A"),
-                         ("FFFF00000001", None, "ttt hello"))
-        self.assertEqual(nbr.describe(b"TS12,-X-------,O,4*00"),
-                         (None, None, "ttt S"))
+        self.assertEqual(nbr.describe(b"TAFFFF00000001,Ann, Lee*3A"),
+                         ("FFFF00000001", "Ann, Lee", "ttt lobby"))
+        self.assertEqual(nbr.describe(b"TIFFFF00000001,0011223344AA,12AB*00"),
+                         ("FFFF00000001", None, "ttt I"))
+        self.assertEqual(nbr.describe(b"TG12AB,S12,-X-------,O,4*00"),
+                         (None, None, "ttt G"))
         self.assertEqual(nbr.describe(b"\xff\x00junk"), (None, None, "unknown"))
         self.assertEqual(nbr.describe(b"BN\xff\xfe"), (None, None, "unknown"))
 
@@ -293,12 +295,12 @@ class NeighbourScreenTests(unittest.TestCase):
         self.assertEqual(self.oled.screen()[1][:8], "223344AA")
 
     def test_lists_a_badge_heard_in_tictactoe_with_rssi_and_age(self):
-        self.other_badge(b"TH" + OTHER_ID.encode() + b",1,0*00")
+        self.other_badge(b"TA" + OTHER_ID.encode() + b",*00")
         run([self.screen], 3000)       # heard at +50 ms, redrawn each second
         self.assertEqual(self.oled.screen()[0], "Nbrs 1 ch1")
         self.assertEqual(self.oled.screen()[1], "223344AA -67  2s")
         n = self.screen.neighbours[OTHER_MAC]
-        self.assertEqual((n.device_id, n.kind, n.count), (OTHER_ID, "ttt hello", 1))
+        self.assertEqual((n.device_id, n.kind, n.count), (OTHER_ID, "ttt lobby", 1))
 
     def test_unknown_sender_is_labelled_by_mac(self):
         self.other_badge(b"hello?")

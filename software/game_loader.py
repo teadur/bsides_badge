@@ -13,6 +13,9 @@ import sys
 GAMES_FOLDER = "games"
 INDEX = "index.json"      # {module: name}, written by the upload tool
 
+# Modules only games import; they are unloaded with the game.
+GAME_HELPERS = ["badge_link"]
+
 
 def module_files(folder):
     """Return {module name: ".py" or ".mpy"} for the modules in folder.
@@ -89,7 +92,8 @@ def unload_games(package=GAMES_FOLDER):
     # The package object keeps each imported game as an attribute, so drop
     # the package too, or the modules stay reachable.
     for key in list(sys.modules):
-        if key == package or key.startswith(package + "."):
+        if key == package or key.startswith(package + ".") or \
+                key in GAME_HELPERS:
             del sys.modules[key]
     gc.collect()
 

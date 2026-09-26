@@ -3,9 +3,11 @@
     mpremote connect /dev/ttyACM0 run tests/tictactoe_wifi_pair_hardware.py
     mpremote connect /dev/ttyACM1 run tests/tictactoe_wifi_pair_hardware.py
 
-No cable is needed: the UART receiver is ignored, so every frame has to come
-over Wi-Fi. The badges link, then play one scripted game in which each side
-takes the first empty cell on its turn. X starts, so both must end on the
+No cable is needed: the cable is ignored, so every frame has to come over
+Wi-Fi. Both badges join the lobby under the name TEST_NAME and only pair
+with each other: the one with the higher ID invites, the other accepts, as
+players would with the buttons. Then they play one scripted game in which
+each side takes the first empty cell on its turn. X starts, so both must end on the
 board XOXOXOX-- with X winning. Each side prints PASS or FAIL; the link log
 (python scripts/badge.py logs) has the full traffic.
 """
@@ -31,13 +33,20 @@ class BadgeStub:
     BTN_NEXT, BTN_PREV, BTN_SELECT, BTN_BACK = 1, 2, 3, 4
     wri6 = Writer(oled, font6, verbose=False)
     GamesScreen = None
+    USERNAME = "ttt-wifi-test"
+
+
+TEST_NAME = BadgeStub.USERNAME
 
 
 sys.modules["bsides"] = BadgeStub()
+import badge_link
 import espnow_link
 from games import tictactoe
 
-LINK_TIMEOUT_MS = 20000
+badge_link.CABLE = False                # Wi-Fi only, even if a cable is on
+
+LINK_TIMEOUT_MS = 45000                 # room for one unanswered invitation
 GAME_TIMEOUT_MS = 60000
 EXPECTED = list("XOXOXOX--")
 
@@ -46,19 +55,39 @@ def say(text):
     print("TTT-WIFI %s: %s" % (BadgeStub.device_id, text))
 
 
+async def pair_in_lobby(game, started):
+    """Invite or accept the other test badge, pressing buttons as a player."""
+    link = game.link
+    while game.phase != "play" or not game.game_no:
+        if time.ticks_diff(time.ticks_ms(), started) > LINK_TIMEOUT_MS:
+            raise RuntimeError("no link within %d ms (phase %s, lobby %s)" % (
+                LINK_TIMEOUT_MS, game.phase, link.state))
+        if link.state == "lobby":
+            players = link.listed()
+            for i, p in enumerate(players):
+                if p.name == TEST_NAME and p.id < link.my_id:
+                    say("inviting %s" % p.id)
+                    link.index = i
+                    await game.handle_button(BadgeStub.BTN_SELECT)
+                    break
+        elif link.state == "invited":
+            inviter = link.players.get(link.target)
+            if inviter is not None and inviter.name == TEST_NAME:
+                say("accepting %s" % inviter.id)
+                await game.handle_button(BadgeStub.BTN_SELECT)
+            else:
+                await game.handle_button(BadgeStub.BTN_NEXT)    # decline
+        await asyncio.sleep_ms(100)
+
+
 async def main():
     say("before start, " + espnow_link.memory())
     game = tictactoe.TicTacToeScreen(oled)
-    game._poll_uart = lambda: None       # Wi-Fi only, even if a cable is on
     started = time.ticks_ms()
     try:
-        if game.espnow is None:
+        if game.link.esp is None:
             raise RuntimeError("ESP-NOW did not start; see the link log")
-        while game.phase != "play" or not game.game_no:
-            if time.ticks_diff(time.ticks_ms(), started) > LINK_TIMEOUT_MS:
-                raise RuntimeError("no link within %d ms (phase %s)" %
-                                   (LINK_TIMEOUT_MS, game.phase))
-            await asyncio.sleep_ms(100)
+        await pair_in_lobby(game, started)
         say("linked in %d ms as %s (%s), peer %s" % (
             time.ticks_diff(time.ticks_ms(), started), game.my_mark(),
             "host" if game.is_host else "guest", game.peer_id))

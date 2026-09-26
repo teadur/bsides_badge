@@ -1,31 +1,21 @@
 import time
 import urandom
-import machine
 import uasyncio as asyncio
 
+import badge_link
 import bsides
-import espnow_link
 import linklog
 
 
 GAME_NAME = "Tic-tac-toe"
 
-# Badge-to-badge link: same wiring as Pong. Hardware UART1 on the UART pads
-# (GPIO20/GPIO21 on the ESP32-C3), TX cross-wired to RX, plus GND.
-UART_ID = 1
-UART_RX = 20
-UART_TX = 21
-UART_BAUD = 115200
-
-# Cable-free fallback: every message is also broadcast over ESP-NOW, so two
-# badges out of cable reach (or with no cable at all) can still find each
-# other. Both links carry the same framed messages and run at the same time;
-# whichever one gets a frame through feeds the same handler, so a badge with
-# no Wi-Fi support (or a broken cable) still works over whichever link is up.
+# Players pick each other in badge_link's lobby (over the radio, or the same
+# cable as Pong: TX to RX both ways plus GND); after that every message goes
+# to the partner over whichever of the two is up.
 #
 # PoC flag: log phase changes, handshake content, and raw traffic on both the
 # cable and the radio to linklog (serial console, Utils -> WiFi neighbours,
-# and /linklog.txt). ESP-NOW bring-up and errors are logged either way. Flip
+# and /linklog.txt). Pairing and ESP-NOW errors are logged either way. Flip
 # to False once linking is confirmed working on real hardware.
 DEBUG_LINK = True
 
@@ -65,49 +55,23 @@ def winner(board):
     return EMPTY, None
 
 
-def checksum(payload):
-    c = 0
-    for b in payload:
-        c ^= b
-    return c
-
-
-def encode(payload):
-    """Frame a payload as T<payload>*<xor checksum in hex>.
-
-    The T prefix and checksum make Pong traffic, line noise from plugging the
-    cable, and truncated lines all fail to decode instead of becoming moves."""
-    return b"T" + payload + ("*%02X" % checksum(payload)).encode()
-
-
-def decode(line):
-    if len(line) < 5 or line[0:1] != b"T" or line[-3:-2] != b"*":
-        return None
-    payload = line[1:-3]
-    try:
-        want = int(line[-2:].decode(), 16)
-    except (ValueError, UnicodeError):
-        return None
-    if checksum(payload) != want:
-        return None
-    return payload
-
 
 class TicTacToeScreen:
     """
-    Two-player tic-tac-toe over the UART cable (same as Pong) and, at the same
-    time, over broadcast ESP-NOW, so a working Wi-Fi radio lets two badges
-    play without the cable. The badge with the higher device ID becomes host:
-    it owns the board and plays X. The host rebroadcasts the full game state
-    as a heartbeat, and the guest repeats its pending move until the board
-    shows it, so dropped or corrupted lines never desynchronise the game -
-    and, since every message is idempotent against the current game number,
-    neither does the same message arriving twice over both links. The starter
-    alternates.
+    Two-player tic-tac-toe. Players pair in badge_link's lobby, then play
+    over the cable and the radio at once. The badge with the higher device ID
+    becomes host: it owns the board and plays X. The host resends the full
+    game state as a heartbeat, and the guest repeats its pending move until
+    the board shows it, so dropped or corrupted messages never desynchronise
+    the game - and, since every message is idempotent against the current
+    game number, neither does one arriving twice over both links. The
+    starter alternates.
     Controls:
+      lobby     -> NEXT/PREV pick a player, SELECT invites; an invitation
+                   is accepted with SELECT, declined with NEXT or BACK
       NEXT/PREV -> move cursor to the next/previous empty cell
       SELECT    -> place mark on your turn / new game when finished /
-                   retry when no peer was found
+                   back to the lobby when the link is lost
       BACK      -> exit to menu
 
     The main UI sees manages_own_render and leaves rendering to the game loop.
@@ -117,26 +81,21 @@ class TicTacToeScreen:
     def __init__(self, oled):
         self.oled = oled
         self.my_id = bsides.device_id
-
-        self.uart = machine.UART(UART_ID, baudrate=UART_BAUD,
-                                 tx=machine.Pin(UART_TX),
-                                 rx=machine.Pin(UART_RX), timeout=0)
-        # None falls back to cable-only; the reason is in the link log.
-        self.espnow, _mac = espnow_link.open_link("ttt", self.my_id)
-        self._radio = (espnow_link.Broadcaster(self.espnow, "ttt")
-                       if self.espnow is not None else None)
+        self.link = badge_link.PeerLink(
+            b"T", "ttt", self.my_id, getattr(bsides, "USERNAME", None) or "",
+            on_paired=self._start_link, on_unpaired=self._on_unpaired,
+            on_message=self._handle_message, debug=DEBUG_LINK)
 
         self.running = True
         self.peer_id = None
         self.is_host = None
-        self._buf = b""
         self._last_move = time.ticks_add(time.ticks_ms(), -MOVE_GUARD_MS)
         self.tick = 0
         self.blink = True
         self._dirty = True
 
         self._clear_game()
-        self._start_link()
+        self._set_phase("lobby")
 
         self._tasks = [asyncio.create_task(self._loop()),
                        asyncio.create_task(self._rx())]
@@ -166,16 +125,21 @@ class TicTacToeScreen:
         self.draws = 0
 
     def _start_link(self):
+        """Paired: exchange hellos with the partner, then play."""
         now = time.ticks_ms()
-        self._set_phase("link")       # link/nolink/lost/clash/play
+        self._set_phase("link")       # lobby/link/lost/clash/play
         self.link_started = now
         self.last_hello = time.ticks_add(now, -HELLO_MS)
         self.last_beat = now
         self.last_rx = now
         self._dirty = True
 
+    def _on_unpaired(self, reason):
+        self._set_phase("lobby")
+        self._dirty = True
+
     def _seeking(self):
-        return self.phase in ("link", "nolink", "lost")
+        return self.phase in ("link", "lost")
 
     def my_mark(self):
         return "X" if self.is_host else "O"
@@ -210,10 +174,7 @@ class TicTacToeScreen:
 
     # ---------- link ----------
     def _send(self, payload):
-        frame = encode(payload)
-        self.uart.write(frame + b"\n")
-        sent = self._radio is not None and self._radio.send(frame)
-        self._dbg("tx", "uart+espnow" if sent else "uart", payload)
+        self.link.send(payload)
 
     def _send_hello(self, need):
         self._send(("H%s,%d,%d" % (self.my_id, 1 if need else 0,
@@ -264,13 +225,7 @@ class TicTacToeScreen:
         return True
 
     # ---------- receive ----------
-    def _handle_line(self, line, via="?"):
-        payload = decode(line)
-        if not payload:
-            if DEBUG_LINK and line:
-                self._dbg("rx", via, "dropped (bad frame):", line)
-            return
-        self._dbg("rx", via, payload)
+    def _handle_message(self, payload):
         tag = payload[0:1]
         try:
             parts = payload[1:].decode().split(",")
@@ -283,7 +238,7 @@ class TicTacToeScreen:
             else:
                 return
         except (ValueError, IndexError, UnicodeError) as exc:
-            self._dbg("rx", via, "dropped (parse error):", exc)
+            self._dbg("dropped message:", payload, repr(exc))
             return
 
     def _on_hello(self, peer_id, peer_seeking, peer_game):
@@ -364,41 +319,14 @@ class TicTacToeScreen:
         elif move != EMPTY:
             self._place(int(move), "O")
 
-    def _poll_uart(self):
-        n = self.uart.any()
-        if not n:
-            return
-        self._buf += self.uart.read(n)
-        i = self._buf.find(b"\n")
-        while i >= 0:
-            self._handle_line(self._buf[:i], "uart")
-            self._buf = self._buf[i + 1:]
-            i = self._buf.find(b"\n")
-        if len(self._buf) > 200:
-            self._buf = self._buf[-64:]
-
-    def _poll_espnow(self):
-        if self.espnow is None:
-            return
-        # Every ESP-NOW datagram is one already-framed message (no newline
-        # splitting needed), so drain whatever arrived since the last poll.
-        while True:
-            try:
-                mac, msg = self.espnow.recv(0)
-            except OSError as exc:
-                linklog.log("ttt", "espnow recv failed:", repr(exc))
-                return
-            if msg is None:
-                return
-            self._handle_line(msg, "espnow(%s)" % espnow_link.mac_hex(mac))
-
-    def _poll_links(self):
-        self._poll_uart()
-        self._poll_espnow()
 
     # ---------- loops ----------
     def _tick(self, now):
         self.tick += 1
+        self.link.tick(now)
+        if self.link.dirty:
+            self.link.dirty = False
+            self._dirty = True
         if self.phase in ("link", "lost", "clash"):
             # keep announcing during a clash so the other badge sees it too
             if time.ticks_diff(now, self.last_hello) >= HELLO_MS:
@@ -406,8 +334,7 @@ class TicTacToeScreen:
                 self.last_hello = now
             if self.phase == "link" and \
                     time.ticks_diff(now, self.link_started) >= LINK_TIMEOUT_MS:
-                self._set_phase("nolink")
-                self._dirty = True
+                self.link.leave("No reply")
         elif self.phase == "play":
             if time.ticks_diff(now, self.last_rx) >= LOST_TIMEOUT_MS:
                 self._set_phase("lost")
@@ -436,7 +363,7 @@ class TicTacToeScreen:
     async def _rx(self):
         try:
             while self.running:
-                self._poll_links()
+                self.link.poll(time.ticks_ms())
                 await asyncio.sleep_ms(10)
         except asyncio.CancelledError:
             return
@@ -446,11 +373,7 @@ class TicTacToeScreen:
         for t in self._tasks:
             t.cancel()
         await asyncio.sleep_ms(0)
-        try:
-            self.uart.deinit()
-        except Exception:
-            pass
-        espnow_link.close_link(self.espnow, "ttt")
+        self.link.close()
 
     # ---------- drawing ----------
     def _center6(self, text, y):
@@ -532,17 +455,16 @@ class TicTacToeScreen:
     def render(self):
         oled = self.oled
         oled.fill(0)
-        if self.phase == "link":
+        if self.phase == "lobby":
+            self.link.render(oled, "TIC-TAC-TOE")
+        elif self.phase == "link":
             self._center6("TIC-TAC-TOE", 10)
-            self._center6("Linking...", 28)
+            self._center6("Starting...", 28)
             self._center6("BACK=Exit", 50)
-        elif self.phase == "nolink":
-            self._center6("No peer found", 16)
-            self._center6("SELECT=Retry", 34)
-            self._center6("BACK=Exit", 48)
         elif self.phase == "lost":
-            self._center6("Link lost", 10)
-            self._center6("Reconnecting...", 28)
+            self._center6("Link lost", 4)
+            self._center6("Reconnecting...", 20)
+            self._center6("SELECT=Lobby", 36)
             self._center6("BACK=Exit", 50)
         elif self.phase == "clash":
             self._center6("Same badge ID", 16)
@@ -559,13 +481,15 @@ class TicTacToeScreen:
 
     # ---------- input ----------
     async def handle_button(self, btn):
+        if self.phase == "lobby" and self.link.handle_button(btn):
+            return self
         if btn == BTN_BACK:
             await self._stop()
             return bsides.GamesScreen(self.oled)
 
-        if self.phase == "nolink":
+        if self.phase == "lost":
             if btn == BTN_SELECT:
-                self._start_link()
+                self.link.leave()
             return self
         if self.phase != "play" or self.game_no == 0:
             return self

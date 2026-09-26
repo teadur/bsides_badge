@@ -367,35 +367,66 @@ because UART packets now include a checksum.
 
 ### Tic-tac-toe link
 
-Tic-tac-toe is the second two-player game and uses the same cable as Pong: TX
-to RX in both directions plus GND. Open Tic-tac-toe on both badges. The higher
-device ID becomes host, owns the board, and plays X. The other badge plays O.
-The first game starts with X and the starter alternates after that.
+Tic-tac-toe is the second two-player game. It works over Wi-Fi (ESP-NOW), or
+over the same cable as Pong: TX to RX in both directions plus GND.
+
+Open Tic-tac-toe on both badges. Each badge starts in a lobby that lists the
+other badges running Tic-tac-toe in Wi-Fi range, by holder name (or the end of
+the device ID when a badge has no name):
+
+- NEXT and PREV pick a player, SELECT invites them, and BACK exits. While you
+  wait for an answer, BACK withdraws the invitation. An invitation that gets
+  no answer is withdrawn after 15 seconds.
+- An invited badge shows who is asking. SELECT accepts, NEXT or BACK
+  declines.
+- Badges joined by a cable pair straight away, without the lobby.
+
+Once two badges pair, they leave the lobby list, so a room can hold any
+number of games. A pair shares a random session code, and each badge only
+takes game messages that carry its session code and come from its partner's
+radio address (or over the cable). Other badges in range cannot interfere
+with a game. A badge that invites a player who is already in a game is told
+no.
+
+The higher device ID becomes host, owns the board, and plays X. The other
+badge plays O. The first game starts with X and the starter alternates after
+that.
 
 - NEXT and PREV move the blinking cursor to the next or previous empty cell.
   A small dot shows where the other player's cursor is.
 - SELECT places your mark on your turn, and starts a new game once one is
   finished. Either player can start the new game.
-- BACK exits.
+- BACK exits. The other badge is told and goes back to its lobby.
 
 The side panel shows your mark, whose turn it is, and the session score as your
 wins against your losses.
 
 Every message carries a checksum, the host repeats the whole board a few times
 per second, and the guest repeats a move until the board shows it. A dropped or
-garbled line therefore cannot desynchronise the game. If the cable is
-unplugged, both badges show "Link lost" and resume the same game when it is
-plugged back in. If one badge leaves and reopens the game, a returning guest
-gets the board back, while a returning host starts a fresh game. Pong traffic
-on the other end is ignored, so both badges must run the same game.
+garbled message therefore cannot desynchronise the game. If the badges lose
+each other (out of range, cable unplugged), both show "Link lost" and resume
+the same game when they are back in touch. SELECT on that screen gives up and
+returns to the lobby. If one badge leaves and reopens the game, a returning
+guest gets the board back, while a returning host starts a fresh game. Pong
+traffic on the cable is ignored.
 
-Every message is also broadcast over ESP-NOW at the same time as the cable, so
-two badges in Wi-Fi range can play with no cable at all, and a badge whose
-espnow bring-up fails (older firmware, radio issue) transparently falls back
-to cable-only play. Both links run together rather than one being chosen over
-the other: whichever one is up carries the game, and since every message is
-guarded by the current game number, the same message arriving twice (once per
-link) is ignored rather than double-applied.
+When both links are up, every message goes over the cable and the radio. The
+game number guards every message, so the same message arriving twice (once
+per link) is ignored rather than applied twice. A badge whose ESP-NOW
+bring-up fails (older firmware, radio issue) still plays over the cable.
+
+The lobby and pairing live in `software/badge_link.py` (`PeerLink`), so other
+two-player games can use them. Frames are `<game prefix><body>*<checksum>`,
+one per ESP-NOW message or cable line. The bodies are:
+
+| Body | Meaning |
+| --- | --- |
+| `A<id>,<name>` | advert, once a second while in the lobby |
+| `I<from>,<to>,<session>` | invitation, repeated until answered |
+| `K<from>,<to>,<session>` | invitation accepted |
+| `N<from>,<to>` | declined, busy, or invitation withdrawn |
+| `G<session>,<message>` | game message, sent only to the partner |
+| `X<session>` | partner left |
 
 The Wi-Fi side is a proof of concept. No badge joins an access point, so both
 radios are set to a fixed channel (`CHANNEL` in `software/espnow_link.py`,
@@ -419,8 +450,10 @@ for port in /dev/ttyACM0 /dev/ttyACM1; do
 done; wait
 ```
 
-Each badge ignores its UART receiver, links over ESP-NOW, and plays one game
-in which both sides take the first empty cell. Each prints lines starting
+Each badge ignores the cable and joins the lobby under a test name. The badge
+with the higher device ID invites the other test badge and the other accepts,
+as players would. They then play one game in which both sides take the first
+empty cell. Other badges nearby do not disturb the test. Each prints lines starting
 with `TTT-WIFI <device ID>:` ending in `PASS` or `FAIL: <reason>`, plus the
 free memory before and after.
 
@@ -428,7 +461,8 @@ That test starts the game without the menu, which leaves Wi-Fi much more
 memory than a player has. `tests/tictactoe_menu_hardware.py`, run the same
 way (`make menu-test`), starts the normal application instead, including the
 whole menu UI, and drives it with simulated button presses: **Games ->
-Tic-tac-toe**, the same scripted game over Wi-Fi only, then BACK. It prints
+Tic-tac-toe**, the invitation through the lobby, the same scripted game over
+Wi-Fi only, then BACK. It prints
 `MENU-TEST <device ID>:` lines ending in `PASS` or `FAIL: <reason>`, including
 free memory in the games menu and after leaving the game, and writes them to
 the link log. When it ends, the badge is left at the MicroPython prompt; the

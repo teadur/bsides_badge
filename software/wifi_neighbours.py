@@ -37,11 +37,16 @@ def describe(msg):
         if msg.startswith(BEACON_TAG):
             parts = msg[2:].decode().split(",", 1)
             return parts[0], parts[1] if len(parts) > 1 else "", "beacon"
-        if msg.startswith(b"TH"):
-            # tic-tac-toe hello: TH<id>,<seeking>,<game>*<checksum>
-            return msg[2:].split(b",", 1)[0].decode(), None, "ttt hello"
         if msg.startswith(b"T") and len(msg) > 1:
-            return None, None, "ttt " + chr(msg[1])
+            # tic-tac-toe (badge_link): T<kind><fields>*<checksum>
+            kind, fields = chr(msg[1]), msg[2:].split(b"*", 1)[0]
+            if kind == "A":         # lobby advert: <id>,<name>
+                parts = fields.decode().split(",", 1)
+                return parts[0], parts[1] if len(parts) > 1 else "", \
+                    "ttt lobby"
+            if kind in "IKN":       # invite, accept, decline: <from>,<to>...
+                return fields.split(b",", 1)[0].decode(), None, "ttt " + kind
+            return None, None, "ttt " + kind
     except UnicodeError:
         pass
     return None, None, "unknown"

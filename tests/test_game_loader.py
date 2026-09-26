@@ -2,6 +2,7 @@ import importlib.util
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -114,6 +115,14 @@ class LoadGameTests(unittest.TestCase):
         loader.load_game("alpha", self.PACKAGE)
         loader.unload_games(self.PACKAGE)
         self.assertFalse([m for m in sys.modules if m.startswith(self.PACKAGE)])
+
+    def test_unload_drops_modules_only_games_use(self):
+        sys.modules["badge_link"] = types.ModuleType("badge_link")
+        try:
+            loader.unload_games(self.PACKAGE)
+            self.assertNotIn("badge_link", sys.modules)
+        finally:
+            sys.modules.pop("badge_link", None)
 
     def test_import_errors_reach_the_caller(self):
         with self.assertRaises(ValueError):

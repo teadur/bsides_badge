@@ -113,7 +113,8 @@ def open_link(owner, device_id):
 
 
 class Broadcaster:
-    """Broadcasts over ESP-NOW, pausing after a failed send."""
+    """Sends over ESP-NOW (to everyone, or to one peer), pausing after a
+    failed send."""
 
     def __init__(self, esp, owner):
         self.esp = esp
@@ -121,14 +122,14 @@ class Broadcaster:
         self.failures = 0
         self.paused_until = None
 
-    def send(self, msg):
-        """Broadcast msg; False if it was skipped or failed."""
+    def send(self, msg, mac=BROADCAST):
+        """Send msg; False if it was skipped or failed."""
         if self.paused_until is not None:
             if time.ticks_diff(self.paused_until, time.ticks_ms()) > 0:
                 return False
             self.paused_until = None
         try:
-            self.esp.send(BROADCAST, msg, False)
+            self.esp.send(mac, msg, False)
         except OSError as exc:
             self.failures += 1
             self.paused_until = time.ticks_add(time.ticks_ms(), SEND_BACKOFF_MS)
