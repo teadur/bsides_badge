@@ -253,10 +253,11 @@ running Tic-tac-toe.
 The link log records ESP-NOW start-up (channel and MAC address, or the
 exact error), every beacon and frame received with its signal strength,
 badges appearing, disappearing and returning, and all Tic-tac-toe link
-traffic. At every start-up it also records free memory twice: `boot wifi
-reserved` before the menu loads and `boot menu ready` after, each with the
-Python heap's free space (`mp free`) and the free space outside it that
-Wi-Fi uses (`idf free`, `largest` block).
+traffic. At every start-up it also records free memory twice, `boot wifi
+reserved` before the menu loads and `boot menu ready` after, and writes both
+to `/linklog.txt` straight away. Each has the Python heap's free space
+(`mp free`) and the free space outside it that Wi-Fi uses (`idf free`,
+`largest` block).
 
 A Wi-Fi send fails with `ESP_ERR_ESPNOW_NO_MEM` when the Wi-Fi driver has no
 memory left for it. MicroPython keeps retrying such a send for 2 seconds, and

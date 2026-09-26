@@ -949,8 +949,10 @@ async def main():
     show_bsides_logo(oled)
     print("Username: {}".format(USERNAME))
     # Compare with the boot "wifi reserved" line: what loading the UI cost.
+    # Written now: a soft reset (mpremote run) would drop lines still batched.
     gc.collect()
     linklog.log("boot", "menu ready,", espnow_link.memory())
+    linklog.flush()
 
     tasks = [
         ui_task(oled), inactivity_task(oled),
