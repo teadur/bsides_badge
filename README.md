@@ -194,16 +194,20 @@ ports in `PORTS` (default `/dev/ttyACM0 /dev/ttyACM1`):
 
 ```console
 make upload                           # upload to every badge, version detected
-make logs                             # save every badge's link log
+make badge-test                       # Wi-Fi test on all badges + logs + report
+make wifi-check                       # upload, then badge-test
+make logs                             # only save every badge's link log
 make logs CLEAR=1                     # ...and delete them on the badges
-make wifi-test                        # Wi-Fi-only tic-tac-toe test, in parallel
-make wifi-check                       # upload, wifi-test, then logs
 make upload PORTS=/dev/ttyACM1 BADGE_VERSION=2026
 ```
 
-`wifi-test` keeps each badge's output in `badge-logs/wifi-test-<port>.txt` and
-fails unless every badge printed PASS. `wifi-check` saves the logs even when
-the test fails.
+`badge-test` runs the Wi-Fi-only tic-tac-toe test on all badges at once, then
+saves each badge's link log, then writes one report file,
+`badge-logs/report-<time>.txt`. The report starts with a PASS/FAIL line per
+badge, followed by every test output and link log from that run, so it is the
+only file to share. The logs and report are collected even when the test
+fails, and the command still exits with the test's status. `make report`
+rebuilds the report of the last run.
 
 Run `python scripts/badge.py --help` or a subcommand with `--help` for all
 options. After a successful operation on a 2026 badge, the tool prints the
