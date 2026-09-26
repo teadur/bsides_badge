@@ -8,6 +8,7 @@ import time, micropython
 from machine import Pin, I2C, RTC
 import ssd1306
 import bsides_logo
+import game_loader
 import rgb_leds
 from badge_config import (
     format_device_id, hardware_for, load_badge_config, save_badge_config)
@@ -775,41 +776,22 @@ class OurteamScreen(TextScreen):
 # Menu screen
 # -----------------------
 
-GAMES_FOLDER = "games"
-
-
-def discover_games():
-    """Return (display name, screen class) pairs exported by games/*.py."""
-    games = []
-    try:
-        filenames = sorted(os.listdir(GAMES_FOLDER))
-    except OSError as exc:
-        print("Cannot scan games directory:", exc)
-        return games
-
-    for filename in filenames:
-        if not filename.endswith(".py") or filename.startswith("_"):
-            continue
-        module_name = filename[:-3]
-        try:
-            module = __import__("games." + module_name, None, None,
-                                ("GAME_NAME", "GameScreen"))
-            games.append((module.GAME_NAME, module.GameScreen))
-        except Exception as exc:
-            # One broken optional game should not prevent the badge from booting.
-            print("Cannot load game {}: {}".format(filename, exc))
-    return games
-
-
 class GamesScreen(ListScreen):
     def __init__(self, oled):
-        self.games = discover_games()
+        self.games = game_loader.discover()
         super().__init__(oled, "Games", self.games)
 
     def on_select(self, index):
-        return self.games[index][1](self.oled)
+        try:
+            screen_class = game_loader.load_game(self.games[index][1])
+        except Exception as exc:
+            # One broken optional game should not take the badge down.
+            print("Cannot load game {}: {}".format(self.games[index][1], exc))
+            return self
+        return screen_class(self.oled)
 
     def on_back(self):
+        game_loader.unload_games()
         return MenuScreen(self.oled)
 
 class MenuScreen(Screen):

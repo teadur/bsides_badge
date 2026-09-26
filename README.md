@@ -228,6 +228,12 @@ GAME_NAME = "My game"
 GameScreen = MyGameScreen
 ```
 
+The menu reads `GAME_NAME` from the file without importing the game, so it
+must be a plain string literal at the start of its own line. Only the game
+you open is imported; any previously opened game is unloaded first, and all
+games are unloaded when you leave the Games menu. This keeps enough memory
+free for Wi-Fi (Tic-tac-toe's ESP-NOW link).
+
 `GameScreen(oled)` must provide `render()` and async `handle_button(btn)`
 methods. Set `manages_own_render = True` when the game owns an animation loop.
 On exit, return `bsides.GamesScreen(oled)`.

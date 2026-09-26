@@ -499,5 +499,5 @@ class PongScreen:
         return self
 
 
-# Contract used by bsides.discover_games().
+# Contract used by game_loader (GAME_NAME is read as a string literal).
 GameScreen = PongScreen

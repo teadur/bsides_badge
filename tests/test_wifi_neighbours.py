@@ -157,6 +157,8 @@ LOG_DIR = tempfile.mkdtemp(prefix="nbr-linklog-")
 linklog.LOG_PATH = str(Path(LOG_DIR) / "linklog.txt")
 linklog.OLD_PATH = str(Path(LOG_DIR) / "linklog.old.txt")
 linklog.print = lambda *args, **kwargs: None
+espnow_link.gc = types.SimpleNamespace(collect=lambda: None,
+                                       mem_free=lambda: 123456)
 
 
 def press(screen, btn):
@@ -304,6 +306,19 @@ class NeighbourScreenTests(unittest.TestCase):
         shown = "".join(r.lstrip() for r in self.oled.screen()[1:])
         self.assertIn("ESP_ERR_WIFI_NOT_INIT", shown)
         self.assertEqual(press(screen, BTN_BACK), "utils")
+
+    def test_start_and_failure_lines_report_heap_and_wifi_memory(self):
+        heap = types.SimpleNamespace(
+            HEAP_DATA=4,
+            idf_heap_info=lambda _caps: [(90000, 30000, 12000, 1),
+                                         (40000, 8000, 7000, 1)])
+        FakeEspNow.fail_init = True
+        with patch.object(espnow_link, "esp32", heap):
+            nbr.WifiNeighboursScreen(self.oled)
+        failure = [l for l in linklog.lines if "init failed" in l][-1]
+        self.assertIn("mp free 123456 idf free 38000 largest 12000", failure)
+        starting = [l for l in linklog.lines if "espnow starting" in l][-1]
+        self.assertIn("mp free 123456 idf free 38000", starting)
 
 
 if __name__ == "__main__":

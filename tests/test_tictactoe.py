@@ -197,6 +197,8 @@ def _install_stubs():
     sys.modules["linklog"].LOG_PATH = str(log_dir / "linklog.txt")
     sys.modules["linklog"].OLD_PATH = str(log_dir / "linklog.old.txt")
     sys.modules["linklog"].print = lambda *args, **kwargs: None
+    sys.modules["espnow_link"].gc = types.SimpleNamespace(
+        collect=lambda: None, mem_free=lambda: 123456)
 
 
 _install_stubs()
