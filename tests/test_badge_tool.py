@@ -235,10 +235,17 @@ class HardwareDetectionTests(unittest.TestCase):
 
     @patch("builtins.print")
     @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
-    def test_probe_failure_returns_none(self, _prefix, _print):
-        output = Namespace(returncode=1, stdout="", stderr="no device")
+    def test_probe_failure_returns_none_and_shows_why(self, _prefix, print_mock):
+        output = Namespace(
+            returncode=1, stdout="",
+            stderr="Traceback:\nmpremote: failed to access /dev/ttyACM1 "
+                   "(it may be in use by another program)\n")
         with patch.object(badge_tool, "run", return_value=output):
-            self.assertIsNone(badge_tool.probe_hardware(None))
+            self.assertIsNone(badge_tool.probe_hardware("/dev/ttyACM1"))
+        self.assertEqual(
+            print_mock.call_args.args[0],
+            "Could not probe the badge hardware: mpremote: failed to access "
+            "/dev/ttyACM1 (it may be in use by another program)")
 
     def test_probe_code_runs_against_fake_pins(self):
         """The snippet sent to the badge, run with stand-in machine classes."""

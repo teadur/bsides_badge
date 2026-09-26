@@ -154,6 +154,12 @@ def mpremote_prefix(port: str | None) -> list[str]:
     return command
 
 
+def mpremote_error(result: subprocess.CompletedProcess[str]) -> str:
+    """The last line mpremote or the badge printed, to explain a failure."""
+    lines = (result.stderr or result.stdout or "").strip().splitlines()
+    return lines[-1].strip() if lines else "exit status {}".format(result.returncode)
+
+
 def remote_read(port: str | None, filename: str) -> str:
     result = run(mpremote_prefix(port) + ["fs", "cat", ":/" + filename],
                  check=False, capture=True, timeout=20)
@@ -290,7 +296,8 @@ def check_firmware_version(port: str | None, latest: Firmware) -> bool:
                  capture=True, timeout=20)
     match = re.search(r"BADGE_MP_VERSION=(\d+\.\d+\.\d+)", result.stdout)
     if not match:
-        print("Warning: could not read the badge's MicroPython version.")
+        print("Warning: could not read the badge's MicroPython version: {}"
+              .format(mpremote_error(result)))
         return False
     current = match.group(1)
     if current == latest.version:
@@ -393,7 +400,8 @@ def probe_hardware(port: str | None) -> str | None:
                  capture=True, timeout=20)
     match = re.search(r"BADGE_PROBE i2c=([\d,]*) gpio4_mv=(\d+)", result.stdout)
     if result.returncode != 0 or not match:
-        print("Could not probe the badge hardware.")
+        print("Could not probe the badge hardware: {}".format(
+            mpremote_error(result)))
         return None
     addresses = [int(a) for a in match.group(1).split(",") if a]
     gpio4_mv = int(match.group(2))
@@ -421,7 +429,10 @@ def resolve_badge_version(explicit: str | None, probed: str | None,
         print("Using badge version {} from badge.json.".format(stored))
         return stored
     raise BadgeToolError(
-        "Could not identify the badge hardware; pass --badge-version.")
+        "Could not identify the badge hardware; pass --badge-version. If "
+        "every mpremote command above failed, the badge is not answering: "
+        "close other programs using the port, or hold SELECT while "
+        "resetting the badge, then retry.")
 
 
 def detect_badge_version(args: argparse.Namespace, port: str | None,
