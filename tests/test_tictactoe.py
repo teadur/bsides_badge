@@ -128,10 +128,21 @@ class FakeEspNow:
 
 class FakeWLAN:
     def __init__(self, *_args, **_kwargs):
-        pass
+        self.channel = None
 
     def active(self, _value=None):
         return True
+
+    def disconnect(self):
+        pass
+
+    def config(self, *args, **kwargs):
+        if kwargs:
+            self.channel = kwargs.get("channel", self.channel)
+            return None
+        if args and args[0] == "mac":
+            return b"\x02\x00\x00\x00\x00\x01"
+        return None
 
 
 async def _sleep_ms(_ms):

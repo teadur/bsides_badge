@@ -29,6 +29,26 @@ UART_BAUD = 115200
 # no Wi-Fi support (or a broken cable) still works over whichever link is up.
 ESPNOW_BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
+# ESP-NOW needs both badges on the same Wi-Fi channel, and neither badge joins
+# an access point here, so nothing else pins one: fix it explicitly instead of
+# hoping both radios boot onto the same default.
+ESPNOW_CHANNEL = 1
+
+# PoC flag: print every link lifecycle event (ESP-NOW bring-up, phase changes,
+# handshake content, and raw traffic on both the cable and the radio) to the
+# serial console (watch it with `mpremote <port> repl` or `mpremote connect
+# <port>`, in the badge management tool's terms). Flip to False once linking
+# is confirmed working on real hardware; the "espnow up"/"espnow init failed"
+# lines print unconditionally either way, since knowing whether the radio
+# came up at all is the first thing "no peer found" needs.
+DEBUG_LINK = True
+
+
+def _mac_hex(mac):
+    if not mac:
+        return "?"
+    return ":".join("%02X" % b for b in mac)
+
 BTN_NEXT = bsides.BTN_NEXT
 BTN_PREV = bsides.BTN_PREV
 BTN_SELECT = bsides.BTN_SELECT
@@ -140,21 +160,42 @@ class TicTacToeScreen:
         self.render()
 
     def _init_espnow(self):
-        """Bring up broadcast ESP-NOW, or return None on any failure.
+        """Bring up broadcast ESP-NOW on a fixed channel, or return None.
 
         A None here just means this badge falls back to the cable: whatever
         firmware or hardware issue caused it (no espnow module, no Wi-Fi
-        radio, driver error) isn't ours to diagnose mid-game."""
+        radio, driver error) isn't ours to diagnose mid-game - but we print
+        it, because a silently-missing radio is exactly what "no peer found"
+        looks like from the other badge."""
         if espnow is None:
+            print("[ttt %s] espnow module unavailable; UART-only" % self.my_id)
             return None
         try:
-            network.WLAN(network.STA_IF).active(True)
+            wlan = network.WLAN(network.STA_IF)
+            wlan.active(True)
+            try:
+                wlan.disconnect()
+            except OSError:
+                pass
+            wlan.config(channel=ESPNOW_CHANNEL)
             link = espnow.ESPNow()
             link.active(True)
             link.add_peer(ESPNOW_BROADCAST)
-            return link
-        except Exception:
+        except Exception as exc:
+            print("[ttt %s] espnow init failed: %r" % (self.my_id, exc))
             return None
+        print("[ttt %s] espnow up: channel %d, mac %s" %
+              (self.my_id, ESPNOW_CHANNEL, _mac_hex(wlan.config("mac"))))
+        return link
+
+    def _dbg(self, *parts):
+        if DEBUG_LINK:
+            print("[ttt %s]" % self.my_id, *parts)
+
+    def _set_phase(self, phase):
+        if phase != getattr(self, "phase", None):
+            self._dbg("phase", getattr(self, "phase", None), "->", phase)
+        self.phase = phase
 
     # ---------- state helpers ----------
     def _clear_game(self):
@@ -172,7 +213,7 @@ class TicTacToeScreen:
 
     def _start_link(self):
         now = time.ticks_ms()
-        self.phase = "link"           # link/nolink/lost/clash/play
+        self._set_phase("link")       # link/nolink/lost/clash/play
         self.link_started = now
         self.last_hello = time.ticks_add(now, -HELLO_MS)
         self.last_beat = now
@@ -215,13 +256,15 @@ class TicTacToeScreen:
 
     # ---------- link ----------
     def _send(self, payload):
+        self._dbg("tx", "uart+espnow" if self.espnow is not None else "uart",
+                   payload)
         frame = encode(payload)
         self.uart.write(frame + b"\n")
         if self.espnow is not None:
             try:
                 self.espnow.send(ESPNOW_BROADCAST, frame)
-            except OSError:
-                pass
+            except OSError as exc:
+                print("[ttt %s] espnow send failed: %r" % (self.my_id, exc))
 
     def _send_hello(self, need):
         self._send(("H%s,%d,%d" % (self.my_id, 1 if need else 0,
@@ -243,7 +286,7 @@ class TicTacToeScreen:
         self.last_beat = time.ticks_ms()
 
     def _enter_play(self):
-        self.phase = "play"
+        self._set_phase("play")
         self.last_rx = time.ticks_ms()
         self._dirty = True
 
@@ -272,10 +315,13 @@ class TicTacToeScreen:
         return True
 
     # ---------- receive ----------
-    def _handle_line(self, line):
+    def _handle_line(self, line, via="?"):
         payload = decode(line)
         if not payload:
+            if DEBUG_LINK and line:
+                self._dbg("rx", via, "dropped (bad frame):", line)
             return
+        self._dbg("rx", via, payload)
         tag = payload[0:1]
         try:
             parts = payload[1:].decode().split(",")
@@ -287,13 +333,16 @@ class TicTacToeScreen:
                 self._on_client(int(parts[0]), int(parts[1]), parts[2])
             else:
                 return
-        except (ValueError, IndexError, UnicodeError):
+        except (ValueError, IndexError, UnicodeError) as exc:
+            self._dbg("rx", via, "dropped (parse error):", exc)
             return
 
     def _on_hello(self, peer_id, peer_seeking, peer_game):
+        self._dbg("hello from", peer_id, "seeking" if peer_seeking else "found",
+                   "game", peer_game)
         self.last_rx = time.ticks_ms()
         if peer_id == self.my_id:
-            self.phase = "clash"
+            self._set_phase("clash")
             self._dirty = True
             return
         if peer_id != self.peer_id:
@@ -373,7 +422,7 @@ class TicTacToeScreen:
         self._buf += self.uart.read(n)
         i = self._buf.find(b"\n")
         while i >= 0:
-            self._handle_line(self._buf[:i])
+            self._handle_line(self._buf[:i], "uart")
             self._buf = self._buf[i + 1:]
             i = self._buf.find(b"\n")
         if len(self._buf) > 200:
@@ -386,12 +435,13 @@ class TicTacToeScreen:
         # splitting needed), so drain whatever arrived since the last poll.
         while True:
             try:
-                _mac, msg = self.espnow.recv(0)
-            except OSError:
+                mac, msg = self.espnow.recv(0)
+            except OSError as exc:
+                self._dbg("espnow recv error:", exc)
                 return
             if msg is None:
                 return
-            self._handle_line(msg)
+            self._handle_line(msg, "espnow(%s)" % _mac_hex(mac))
 
     def _poll_links(self):
         self._poll_uart()
@@ -407,11 +457,11 @@ class TicTacToeScreen:
                 self.last_hello = now
             if self.phase == "link" and \
                     time.ticks_diff(now, self.link_started) >= LINK_TIMEOUT_MS:
-                self.phase = "nolink"
+                self._set_phase("nolink")
                 self._dirty = True
         elif self.phase == "play":
             if time.ticks_diff(now, self.last_rx) >= LOST_TIMEOUT_MS:
-                self.phase = "lost"
+                self._set_phase("lost")
                 self.last_hello = time.ticks_add(now, -HELLO_MS)
                 self._dirty = True
             elif time.ticks_diff(now, self.last_beat) >= BEAT_MS:

@@ -275,3 +275,15 @@ to cable-only play. Both links run together rather than one being chosen over
 the other: whichever one is up carries the game, and since every message is
 guarded by the current game number, the same message arriving twice (once per
 link) is ignored rather than double-applied.
+
+This is a proof of concept for the Wi-Fi side: neither badge joins an access
+point, so both radios are pinned to a fixed channel (`ESPNOW_CHANNEL` in
+`tictactoe.py`, currently channel 1) since ESP-NOW otherwise has nothing to
+make them agree on one. `DEBUG_LINK` in the same file (on by default while
+this is being shaken out on hardware) prints every link lifecycle event -
+ESP-NOW bring-up (or why it failed), phase changes, handshake content, and
+every frame sent or received on both the cable and the radio - to the serial
+console. Watch it with the badge tool's underlying `mpremote <port> repl`.
+A badge that never prints "espnow up: channel ..., mac ..." has a radio or
+firmware problem, not a peer-discovery one - that line alone answers most
+"no peer found" reports. Set `DEBUG_LINK = False` once linking is confirmed.
