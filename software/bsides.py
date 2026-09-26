@@ -951,6 +951,7 @@ async def main():
     # Compare with the boot "wifi reserved" line: what loading the UI cost.
     # Written now: a soft reset (mpremote run) would drop lines still batched.
     gc.collect()
+    linklog.identity = device_id
     linklog.log("boot", "menu ready,", espnow_link.memory())
     linklog.flush()
 
@@ -961,6 +962,11 @@ async def main():
             mute_game_lights)]
     import plugin_leds
     tasks.append(plugin_leds.led_task(plugin_effect, mute_game_lights))
+    # A hardware test can register a driver that presses buttons through
+    # this UI (tests/tictactoe_menu_hardware.py).
+    driver = sys.modules.get("badge_test_driver")
+    if driver is not None:
+        tasks.append(driver.run())
     await asyncio.gather(*tasks)
 
 try:

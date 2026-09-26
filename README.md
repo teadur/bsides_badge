@@ -211,20 +211,22 @@ ports in `PORTS` (default `/dev/ttyACM0 /dev/ttyACM1`):
 make tools                            # install esptool, mpremote, mpy-cross
 make upload                           # upload to every badge, version detected
 make upload NO_COMPILE=1              # ...as .py sources instead of .mpy
-make badge-test                       # Wi-Fi test on all badges + logs + report
+make badge-test                       # both Wi-Fi tests + logs + report
 make wifi-check                       # upload, then badge-test
 make logs                             # only save every badge's link log
 make logs CLEAR=1                     # ...and delete them on the badges
 make upload PORTS=/dev/ttyACM1 BADGE_VERSION=2026
 ```
 
-`badge-test` runs the Wi-Fi-only tic-tac-toe test on all badges at once, then
-saves each badge's link log, then writes one report file,
+`badge-test` runs both Wi-Fi tic-tac-toe tests (see
+[Tic-tac-toe link](#tic-tac-toe-link)) on all badges at once: `wifi-test`,
+which starts the game directly, then `menu-test`, which opens it from the
+menu. It then saves each badge's link log and writes one report file,
 `badge-logs/report-<time>.txt`. The report starts with a PASS/FAIL line per
-badge, followed by every test output and link log from that run, so it is the
-only file to share. The logs and report are collected even when the test
-fails, and the command still exits with the test's status. `make report`
-rebuilds the report of the last run.
+badge and test, followed by every test output and link log from that run, so
+it is the only file to share. The logs and report are collected even when a
+test fails, and the command fails if either test did. `make report` rebuilds
+the report of the last run.
 
 Run `python scripts/badge.py --help` or a subcommand with `--help` for all
 options. After a successful operation on a 2026 badge, the tool prints the
@@ -420,6 +422,14 @@ done; wait
 Each badge ignores its UART receiver, links over ESP-NOW, and plays one game
 in which both sides take the first empty cell. Each prints lines starting
 with `TTT-WIFI <device ID>:` ending in `PASS` or `FAIL: <reason>`, plus the
-free memory before and after. This runs outside the menu. To check that Wi-Fi
-also starts from **Games -> Tic-tac-toe**, open the game on both badges
-without the cable and save both logs with `python scripts/badge.py logs`.
+free memory before and after.
+
+That test starts the game without the menu, which leaves Wi-Fi much more
+memory than a player has. `tests/tictactoe_menu_hardware.py`, run the same
+way (`make menu-test`), starts the normal application instead, including the
+whole menu UI, and drives it with simulated button presses: **Games ->
+Tic-tac-toe**, the same scripted game over Wi-Fi only, then BACK. It prints
+`MENU-TEST <device ID>:` lines ending in `PASS` or `FAIL: <reason>`, including
+free memory in the games menu and after leaving the game, and writes them to
+the link log. When it ends, the badge is left at the MicroPython prompt; the
+next `make logs` (or a reset) starts the application again.

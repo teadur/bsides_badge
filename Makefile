@@ -1,7 +1,7 @@
 # Badge workflows for one or more badges on USB serial ports.
 #
 #   make upload       upload to every badge in PORTS
-#   make badge-test   Wi-Fi test on all badges, pull their logs, write a report
+#   make badge-test   Wi-Fi tests on all badges, pull their logs, write a report
 #   make wifi-check   upload, then badge-test
 #
 # Override on the command line, e.g.
@@ -24,7 +24,7 @@ CLEAR_ARG = $(if $(CLEAR),--clear)
 COMPILE_ARG = $(if $(NO_COMPILE),--no-compile)
 
 .DEFAULT_GOAL := help
-.PHONY: help tools upload logs wifi-test badge-test report wifi-check test
+.PHONY: help tools upload logs wifi-test menu-test badge-test report wifi-check test
 
 help:
 	@echo "Targets (PORTS=\"$(PORTS)\"):"
@@ -32,10 +32,11 @@ help:
 	@echo "  upload      upload precompiled application files; hardware version"
 	@echo "              is detected (BADGE_VERSION=2026 overrides, NO_COMPILE=1"
 	@echo "              uploads .py sources)"
-	@echo "  badge-test  run the Wi-Fi test on all badges at once, save their"
+	@echo "  badge-test  run both Wi-Fi tests on all badges at once, save their"
 	@echo "              link logs, and bundle the run into one report file"
 	@echo "  wifi-check  upload, then badge-test"
-	@echo "  wifi-test   only the Wi-Fi test"
+	@echo "  wifi-test   only the test that starts tic-tac-toe directly"
+	@echo "  menu-test   only the test that opens it from the menu"
 	@echo "  logs        only save each badge's link log to $(LOG_DIR)/"
 	@echo "              (CLEAR=1 also deletes it on the badge)"
 	@echo "  report      bundle the files of the last badge-test run again"
@@ -56,33 +57,41 @@ logs:
 		$(BADGE) logs --port $$port $(CLEAR_ARG); \
 	done
 
+# wifi-test starts tic-tac-toe by itself; menu-test starts the normal
+# application and opens Games -> Tic-tac-toe with simulated button presses.
+wifi-test: TEST_SCRIPT = tests/tictactoe_wifi_pair_hardware.py
+wifi-test: TEST_MARKER = TTT-WIFI
+menu-test: TEST_SCRIPT = tests/tictactoe_menu_hardware.py
+menu-test: TEST_MARKER = MENU-TEST
+
 # Both badges must run at the same time, so start them in parallel and keep
-# each side's output in $(LOG_DIR)/wifi-test-<port>.txt.
-wifi-test:
+# each side's output in $(LOG_DIR)/<test>-<port>.txt.
+wifi-test menu-test:
 	@mkdir -p $(LOG_DIR); \
 	for port in $(PORTS); do \
-		out=$(LOG_DIR)/wifi-test-$$(basename $$port).txt; \
-		( $(PY) -m mpremote connect $$port \
-			run tests/tictactoe_wifi_pair_hardware.py 2>&1 \
+		out=$(LOG_DIR)/$@-$$(basename $$port).txt; \
+		( $(PY) -m mpremote connect $$port run $(TEST_SCRIPT) 2>&1 \
 			| tee $$out | sed "s|^|[$$(basename $$port)] |" ) & \
 	done; \
 	wait; \
 	status=0; \
 	for port in $(PORTS); do \
-		out=$(LOG_DIR)/wifi-test-$$(basename $$port).txt; \
-		if grep -q "TTT-WIFI .*: PASS" $$out; then \
-			echo "PASS $$port"; \
+		out=$(LOG_DIR)/$@-$$(basename $$port).txt; \
+		if grep -q "$(TEST_MARKER) .*: PASS" $$out; then \
+			echo "PASS $@ $$port"; \
 		else \
-			echo "FAIL $$port (see $$out)"; status=1; \
+			echo "FAIL $@ $$port (see $$out)"; status=1; \
 		fi; \
 	done; \
 	exit $$status
 
-# The logs and the report are collected even when the test fails; that is
-# when they matter most. The exit status is the test's.
+# The logs and the report are collected even when a test fails; that is
+# when they matter most. It fails if either test failed.
 badge-test:
 	@mkdir -p $(LOG_DIR); touch $(RUN_STAMP)
-	@$(MAKE) --no-print-directory wifi-test; status=$$?; \
+	@status=0; \
+	$(MAKE) --no-print-directory wifi-test || status=1; \
+	$(MAKE) --no-print-directory menu-test || status=1; \
 	$(MAKE) --no-print-directory logs; \
 	$(MAKE) --no-print-directory report; \
 	exit $$status
@@ -92,6 +101,7 @@ badge-test:
 report:
 	@test -f $(RUN_STAMP) || { echo "No badge-test run yet."; exit 1; }; \
 	files="$$(find $(LOG_DIR) -maxdepth 1 -newer $(RUN_STAMP) -name 'wifi-test-*.txt' | sort) \
+		$$(find $(LOG_DIR) -maxdepth 1 -newer $(RUN_STAMP) -name 'menu-test-*.txt' | sort) \
 		$$(find $(LOG_DIR) -maxdepth 1 -newer $(RUN_STAMP) -name 'linklog-*.txt' | sort)"; \
 	out=$(LOG_DIR)/report-$$(date +%Y%m%d-%H%M%S).txt; \
 	{ \
@@ -99,8 +109,8 @@ report:
 		echo "# git $$(git rev-parse --short HEAD 2>/dev/null) $$(git branch --show-current 2>/dev/null)"; \
 		echo "# ports $(PORTS)"; \
 		for f in $$files; do \
-			case $$f in *wifi-test-*) \
-				result=$$(grep -o "TTT-WIFI .*: \(PASS\|FAIL.*\)" $$f | tail -1); \
+			case $$f in *-test-*) \
+				result=$$(grep -o "\(TTT-WIFI\|MENU-TEST\) .*: \(PASS\|FAIL.*\)" $$f | tail -1); \
 				echo "# $$(basename $$f .txt): $${result:-no result}";; \
 			esac; \
 		done; \
