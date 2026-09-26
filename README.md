@@ -188,6 +188,23 @@ If your badge is somehow bricked (wrong version flashed, etc.) and does not
 respond to `esptool`, try  holding down BACK button (GPIO9) while resetting
 or turning your badge on. This will start ESP32 in bootloader mode.
 
+For several badges at once, the `Makefile` wraps these commands. It runs
+`uv run python3` by default (set `PY=python3` to change that) against the
+ports in `PORTS` (default `/dev/ttyACM0 /dev/ttyACM1`):
+
+```console
+make upload                           # upload to every badge, version detected
+make logs                             # save every badge's link log
+make logs CLEAR=1                     # ...and delete them on the badges
+make wifi-test                        # Wi-Fi-only tic-tac-toe test, in parallel
+make wifi-check                       # upload, wifi-test, then logs
+make upload PORTS=/dev/ttyACM1 BADGE_VERSION=2026
+```
+
+`wifi-test` keeps each badge's output in `badge-logs/wifi-test-<port>.txt` and
+fails unless every badge printed PASS. `wifi-check` saves the logs even when
+the test fails.
+
 Run `python scripts/badge.py --help` or a subcommand with `--help` for all
 options. After a successful operation on a 2026 badge, the tool prints the
 currently measured battery voltage as its final output line. It adds
