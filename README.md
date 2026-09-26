@@ -128,6 +128,14 @@ Upload only application files:
 python scripts/badge.py upload --badge-version 2026
 ```
 
+For a dev/test badge that is not a real hardware year, pass
+`--badge-version currentcommit` to `upload` or `flash` instead of a year. The
+tool resolves it to the repository's current short git commit hash and
+stores that as `badge_version`, so **Menu -> Badge -> Status** shows exactly
+which build is on the badge. Pin/hardware selection falls back to the 2025
+layout for this label, so use a real `--badge-version` on physical 2025 or
+2026 hardware.
+
 The `upload` command replaces the badge's entire `/logos` directory with the
 current sponsor set, so logos removed from the repository do not remain on the
 badge.

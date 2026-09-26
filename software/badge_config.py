@@ -51,6 +51,17 @@ def default_config():
     }
 
 
+def _is_dev_commit_label(value):
+    """8 lowercase hex chars: a --badge-version currentcommit build label."""
+    if not isinstance(value, str) or len(value) != 8:
+        return False
+    try:
+        int(value, 16)
+        return True
+    except ValueError:
+        return False
+
+
 def is_valid_device_id(value):
     if not isinstance(value, str) or len(value) != 12:
         return False
@@ -122,7 +133,8 @@ def load_badge_config():
         config["holder_name"] = legacy_name
         changed = True
 
-    if config["badge_version"] not in SUPPORTED_BADGE_VERSIONS:
+    if (config["badge_version"] not in SUPPORTED_BADGE_VERSIONS
+            and not _is_dev_commit_label(config["badge_version"])):
         config["badge_version"] = "2025"
         changed = True
     if not is_valid_device_id(config["device_id"]):

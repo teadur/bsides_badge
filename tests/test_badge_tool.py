@@ -5,6 +5,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 from unittest.mock import call, patch
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -205,6 +206,44 @@ class BadgeToolTests(unittest.TestCase):
             wipe=False, holder_name=None, no_git_info=False)
         badge_tool.command_upload(args)
         remove_logos.assert_called_once_with("COM10")
+
+
+    @patch.object(badge_tool, "current_commit_short", return_value="ab05410c")
+    def test_resolve_badge_version_sentinel_uses_current_commit(self, commit):
+        self.assertEqual(
+            badge_tool.resolve_badge_version(badge_tool.CURRENT_COMMIT_VERSION),
+            "ab05410c")
+        commit.assert_called_once_with()
+
+    def test_resolve_badge_version_passes_through_real_versions(self):
+        self.assertEqual(badge_tool.resolve_badge_version("2026"), "2026")
+        self.assertIsNone(badge_tool.resolve_badge_version(None))
+
+    @patch.object(badge_tool.subprocess, "run")
+    def test_current_commit_short_reads_git_head(self, run):
+        run.return_value.stdout = "ab05410c\n"
+        self.assertEqual(badge_tool.current_commit_short(), "ab05410c")
+        run.assert_called_once_with(
+            ["git", "rev-parse", "--short=8", "HEAD"], cwd=badge_tool.ROOT,
+            check=True, text=True, capture_output=True)
+
+    @patch.object(badge_tool.subprocess, "run",
+                  side_effect=subprocess.CalledProcessError(1, "git"))
+    def test_current_commit_short_raises_tool_error_outside_git(self, _run):
+        with self.assertRaises(badge_tool.BadgeToolError):
+            badge_tool.current_commit_short()
+
+    @patch.object(badge_tool, "current_commit_short", return_value="ab05410c")
+    def test_upload_and_flash_accept_currentcommit_sentinel(self, _commit):
+        parser = badge_tool.build_parser()
+        for command in ("upload", "flash"):
+            with self.subTest(command=command):
+                args = parser.parse_args([
+                    command, "--badge-version", "currentcommit"])
+                self.assertEqual(args.badge_version, "currentcommit")
+                self.assertEqual(
+                    badge_tool.require_badge_version(args.badge_version),
+                    "ab05410c")
 
 
 if __name__ == "__main__":

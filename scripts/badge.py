@@ -25,6 +25,8 @@ SOFTWARE_DIR = ROOT / "software"
 DEFAULT_FIRMWARE_DIR = ROOT / ".cache" / "firmware"
 DOWNLOAD_PAGE = "https://micropython.org/download/ESP32_GENERIC_C3/"
 SUPPORTED_BADGES = ("2025_prototype", "2025", "2026")
+CURRENT_COMMIT_VERSION = "currentcommit"
+BADGE_VERSION_CHOICES = SUPPORTED_BADGES + (CURRENT_COMMIT_VERSION,)
 SKIPPED_NAMES = {".ds_store", "badge.json", "requirements.txt"}
 LEGACY_FILES = ("params.json", "id.txt", "yourname.txt")
 OBSOLETE_FILES = ("bsides25.py",)
@@ -360,10 +362,35 @@ def upload_tree(port: str | None, config: dict[str, Any]) -> str | None:
     return battery_line
 
 
+def current_commit_short() -> str:
+    """Resolve the tool's own current short git commit hash."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short=8", "HEAD"], cwd=ROOT,
+            check=True, text=True, capture_output=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise BadgeToolError(
+            "Could not resolve --badge-version {}: {}".format(
+                CURRENT_COMMIT_VERSION, exc))
+    return result.stdout.strip()
+
+
+def resolve_badge_version(value: str | None) -> str | None:
+    """Turn the 'currentcommit' sentinel into the actual short commit hash.
+
+    Used to label dev/test badges by build instead of a real hardware year;
+    hardware_for() on the badge falls back to the 2025 pin layout for any
+    value it does not recognize.
+    """
+    if value == CURRENT_COMMIT_VERSION:
+        return current_commit_short()
+    return value
+
+
 def require_badge_version(value: str | None) -> str:
     if not value:
         raise BadgeToolError("--badge-version is required for this command.")
-    return value
+    return resolve_badge_version(value)
 
 
 def command_init(args: argparse.Namespace) -> None:
@@ -442,7 +469,8 @@ def command_name(args: argparse.Namespace) -> str | None:
     remote = read_remote_config(port)
     if not remote and not args.badge_version:
         raise BadgeToolError("Badge is not initialized; also pass --badge-version.")
-    config = merge_config(remote, args.badge_version, args.name, not args.no_git_info)
+    config = merge_config(remote, resolve_badge_version(args.badge_version),
+                          args.name, not args.no_git_info)
     write_remote_config(port, config)
     battery_line = battery_voltage_line(port, config)
     run(mpremote_prefix(port) + ["reset"], check=False, timeout=20)
@@ -453,7 +481,11 @@ def command_name(args: argparse.Namespace) -> str | None:
 def add_connection_options(parser: argparse.ArgumentParser, *, version: bool = False) -> None:
     parser.add_argument("--port", help="serial port (auto-detected by default)")
     if version:
-        parser.add_argument("--badge-version", choices=SUPPORTED_BADGES, required=True)
+        parser.add_argument(
+            "--badge-version", choices=BADGE_VERSION_CHOICES, required=True,
+            help="hardware year, or '{}' to label a dev/test build with the "
+                 "current short git commit (falls back to 2025 pins)".format(
+                     CURRENT_COMMIT_VERSION))
 
 
 def add_metadata_options(parser: argparse.ArgumentParser) -> None:
@@ -493,7 +525,7 @@ def build_parser() -> argparse.ArgumentParser:
     name = subparsers.add_parser("name", help="write the holder name to badge.json")
     add_connection_options(name)
     name.add_argument("name")
-    name.add_argument("--badge-version", choices=SUPPORTED_BADGES)
+    name.add_argument("--badge-version", choices=BADGE_VERSION_CHOICES)
     name.add_argument("--skip-version-check", action="store_true")
     name.add_argument("--no-git-info", action="store_true")
     name.set_defaults(handler=command_name)
