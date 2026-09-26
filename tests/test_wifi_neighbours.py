@@ -74,6 +74,8 @@ class FakeEspNow:
         self.active_ = False
         self.inbox = []
         self.sent = []
+        self.sync_args = []
+        self.fail_send = False
         self.peers_table = {}
         self.mac = b"\x02\x00\x00\x00\x00\x01"
         FakeEspNow.air.radios.append(self)
@@ -86,7 +88,10 @@ class FakeEspNow:
     def add_peer(self, _mac):
         pass
 
-    def send(self, _mac, msg):
+    def send(self, _mac, msg, sync=True):
+        self.sync_args.append(sync)
+        if self.fail_send:
+            raise OSError(-12391, "ESP_ERR_ESPNOW_NO_MEM")
         self.sent.append(bytes(msg))
         for radio in FakeEspNow.air.radios:
             if radio is not self and radio.active_ and self.active_:
@@ -223,6 +228,42 @@ class ReserveDriverTests(unittest.TestCase):
                       linklog.lines[-1])
 
 
+class ReserveDriverLogTests(unittest.TestCase):
+    def test_success_logs_memory_for_comparison_with_menu_ready(self):
+        espnow_link.reserve_driver()
+        self.assertRegex(linklog.lines[-1], r"boot wifi reserved, mp free \d+$")
+
+
+class BroadcasterTests(unittest.TestCase):
+    def setUp(self):
+        _Clock.now = 100000
+        FakeEspNow.air = Air()
+        FakeEspNow.fail_init = False
+        self.esp = FakeEspNow()
+        self.esp.active(True)
+        self.radio = espnow_link.Broadcaster(self.esp, "test")
+
+    def test_sends_without_waiting_for_delivery(self):
+        self.assertTrue(self.radio.send(b"hello"))
+        self.assertEqual((self.esp.sent, self.esp.sync_args), ([b"hello"], [False]))
+
+    def test_failed_send_pauses_sends_then_recovers(self):
+        self.esp.fail_send = True
+        self.assertFalse(self.radio.send(b"one"))
+        self.assertIn("test espnow send failed: OSError(-12391, "
+                      "'ESP_ERR_ESPNOW_NO_MEM') - pausing sends for 5000 ms, "
+                      "mp free 123456", linklog.lines[-1])
+        _Clock.now += espnow_link.SEND_BACKOFF_MS - 1
+        self.assertFalse(self.radio.send(b"skipped"))
+        self.assertEqual(len(self.esp.sync_args), 1)    # driver not asked again
+        self.esp.fail_send = False
+        _Clock.now += 1
+        self.assertTrue(self.radio.send(b"two"))
+        self.assertEqual(self.esp.sent, [b"two"])
+        self.assertIn("test espnow sending again after 1 failed sends",
+                      linklog.lines[-1])
+
+
 class NeighbourScreenTests(unittest.TestCase):
     def setUp(self):
         _Clock.now = 100000
@@ -239,6 +280,17 @@ class NeighbourScreenTests(unittest.TestCase):
         sent = self.screen.esp.sent
         self.assertIn(len(sent), (3, 4))
         self.assertEqual(nbr.describe(sent[0]), (MY_ID, "Ada, Lovelace", "beacon"))
+
+    def test_starved_radio_backs_off_and_the_screen_keeps_working(self):
+        esp = self.screen.esp
+        esp.fail_send = True
+        run([self.screen], 12000)
+        # One attempt per back-off period instead of one per second.
+        self.assertEqual(len(esp.sync_args), 3)
+        self.assertEqual(self.screen.sent, 0)
+        self.other_badge(nbr.beacon(OTHER_ID, "Bob"))
+        run([self.screen], nbr.REDRAW_MS + 100)
+        self.assertEqual(self.oled.screen()[1][:8], "223344AA")
 
     def test_lists_a_badge_heard_in_tictactoe_with_rssi_and_age(self):
         self.other_badge(b"TH" + OTHER_ID.encode() + b",1,0*00")

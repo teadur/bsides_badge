@@ -1,6 +1,7 @@
 """Broadcast ESP-NOW bring-up shared by the badge-to-badge Wi-Fi features."""
 
 import gc
+import time
 
 import linklog
 
@@ -22,6 +23,11 @@ BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 # ESP-NOW only reaches badges on the same Wi-Fi channel, and no badge joins an
 # access point here, so nothing else would make the radios agree on one.
 CHANNEL = 1
+
+# MicroPython retries a send for up to 2 s while the Wi-Fi driver has no
+# memory for it, and nothing else on the badge runs meanwhile (a starved badge
+# stopped answering on USB). After a failed send, skip sends for this long.
+SEND_BACKOFF_MS = 5000
 
 
 def mac_hex(mac):
@@ -56,6 +62,9 @@ def reserve_driver():
     except Exception as exc:
         linklog.log("boot", "wifi reserve failed:", repr(exc), memory())
         linklog.flush()
+        return
+    gc.collect()
+    linklog.log("boot", "wifi reserved,", memory())
 
 
 def open_link(owner, device_id):
@@ -101,6 +110,36 @@ def open_link(owner, device_id):
     linklog.log(owner, "espnow up ch", CHANNEL, "mac", mac_hex(mac))
     linklog.log(owner, "after start,", memory())
     return esp, mac
+
+
+class Broadcaster:
+    """Broadcasts over ESP-NOW, pausing after a failed send."""
+
+    def __init__(self, esp, owner):
+        self.esp = esp
+        self.owner = owner
+        self.failures = 0
+        self.paused_until = None
+
+    def send(self, msg):
+        """Broadcast msg; False if it was skipped or failed."""
+        if self.paused_until is not None:
+            if time.ticks_diff(self.paused_until, time.ticks_ms()) > 0:
+                return False
+            self.paused_until = None
+        try:
+            self.esp.send(BROADCAST, msg, False)
+        except OSError as exc:
+            self.failures += 1
+            self.paused_until = time.ticks_add(time.ticks_ms(), SEND_BACKOFF_MS)
+            linklog.log(self.owner, "espnow send failed:", repr(exc),
+                        "- pausing sends for", SEND_BACKOFF_MS, "ms,", memory())
+            return False
+        if self.failures:
+            linklog.log(self.owner, "espnow sending again after",
+                        self.failures, "failed sends")
+            self.failures = 0
+        return True
 
 
 def close_link(esp, owner):

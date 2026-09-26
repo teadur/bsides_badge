@@ -59,22 +59,27 @@ def run(command: list[str], *, check: bool = True, capture: bool = False,
 
 def tool_command(tool: str) -> list[str] | None:
     """Return a command for an importable module or standalone executable."""
-    if importlib.util.find_spec(tool) is not None:
-        return [sys.executable, "-m", tool]
+    module = tool.replace("-", "_")        # the mpy-cross package is mpy_cross
+    if importlib.util.find_spec(module) is not None:
+        return [sys.executable, "-m", module]
     executable = shutil.which(tool)
     return [executable] if executable else None
 
 
-def ensure_tools(install: bool) -> None:
-    packages = [package for package in ("esptool", "mpremote")
-                if tool_command(package) is None]
+BASE_TOOLS = ("esptool", "mpremote")
+ALL_TOOLS = BASE_TOOLS + ("mpy-cross",)
+
+
+def ensure_tools(install: bool, tools: tuple[str, ...] = BASE_TOOLS) -> None:
+    packages = [package for package in tools if tool_command(package) is None]
     if not packages:
-        print("esptool and mpremote are installed.")
+        print("{} installed.".format(", ".join(tools)))
         return
     if not install:
         raise BadgeToolError(
-            "Missing {}. Run 'python scripts/badge.py init'.".format(
-                ", ".join(packages)))
+            "Missing {0}. Run 'python scripts/badge.py init', or install into "
+            "this Python environment, e.g. 'uv pip install {1}'.".format(
+                ", ".join(packages), " ".join(packages)))
     run([sys.executable, "-m", "pip", "install", "--user"] + packages)
 
 
@@ -267,18 +272,120 @@ def clean_bytecode_cache() -> int:
     return len(caches) + len(bytecode)
 
 
-def upload_entries(files: list[Path], root: Path = SOFTWARE_DIR) -> list[Path]:
-    names = {path.relative_to(SOFTWARE_DIR).parts[0] for path in files}
-    return [root / name for name in sorted(names)]
+# Compiling a module on the badge needs several times its size in RAM, and
+# that peak permanently grows the Python heap into the memory the Wi-Fi driver
+# needs, so modules are uploaded as precompiled .mpy bytecode. MicroPython
+# only runs these two as source.
+SOURCE_ONLY = {"main.py", "boot.py"}
+GAMES_INDEX = Path("games") / "index.json"
 
 
-def stage_upload_files(files: list[Path], root: Path) -> list[Path]:
-    """Copy approved files into an isolated tree for recursive upload."""
+def load_game_loader() -> Any:
+    """The badge's own game_loader, so game names are read the same way."""
+    spec = importlib.util.spec_from_file_location(
+        "badge_game_loader", SOFTWARE_DIR / "game_loader.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+def compile_module(source: Path, destination: Path) -> None:
+    command = tool_command("mpy-cross")
+    if command is None:
+        raise BadgeToolError("mpy-cross is not installed.")
+    relative = source.relative_to(SOFTWARE_DIR).as_posix()
+    result = subprocess.run(
+        command + ["-o", str(destination), "-s", relative, str(source)],
+        text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        raise BadgeToolError("mpy-cross failed on {}: {}".format(
+            relative, (result.stderr or result.stdout).strip()))
+
+
+def stage_upload_files(files: list[Path], root: Path, compile_modules: bool
+                       ) -> tuple[list[Path], list[str]]:
+    """Copy approved files into an isolated tree for recursive upload.
+
+    With compile_modules, modules are staged as .mpy and the games get an
+    index of their names (a .mpy has no GAME_NAME line to read). Returns the
+    upload entries and the badge paths of the .py files the .mpy replace."""
+    replaced = []
     for source in files:
-        destination = root / source.relative_to(SOFTWARE_DIR)
+        relative = source.relative_to(SOFTWARE_DIR)
+        destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
-    return upload_entries(files, root)
+        if compile_modules and relative.suffix == ".py" \
+                and relative.as_posix() not in SOURCE_ONLY:
+            compile_module(source, destination.with_suffix(".mpy"))
+            replaced.append("/" + relative.as_posix())
+        else:
+            shutil.copy2(source, destination)
+    if compile_modules and (root / GAMES_INDEX.parent).is_dir():
+        games = load_game_loader().discover(str(SOFTWARE_DIR / "games"))
+        (root / GAMES_INDEX).write_text(
+            json.dumps({module: name for name, module in games}),
+            encoding="utf-8")
+    # Top-level entries of the staged tree, which has .mpy names, not .py.
+    return sorted(root.iterdir()), replaced
+
+
+BADGE_MPY_CODE = (
+    "import sys; "
+    "print('BADGE_MPY=%d' % (getattr(sys.implementation, '_mpy', 0) & 0xff))")
+
+REMOVE_FILES_CODE = """import os
+for p in {paths!r}:
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+print('BADGE_REMOVED')
+"""
+
+
+def check_mpy_compatible(port: str | None) -> None:
+    """Refuse to upload .mpy files the badge's MicroPython cannot import:
+    main.py would fail on its first import and the badge would not start."""
+    command = tool_command("mpy-cross")
+    if command is None:
+        raise BadgeToolError("mpy-cross is not installed.")
+    cross = subprocess.run(command + ["--version"], text=True,
+                           capture_output=True, check=False)
+    match = re.search(r"mpy v(\d+)", cross.stdout + cross.stderr)
+    if not match:
+        raise BadgeToolError("Could not read the mpy-cross version: {}".format(
+            (cross.stderr or cross.stdout).strip()))
+    writes = int(match.group(1))
+    result = run(mpremote_prefix(port) + ["exec", BADGE_MPY_CODE], check=False,
+                 capture=True, timeout=20)
+    found = re.search(r"BADGE_MPY=(\d+)", result.stdout)
+    if result.returncode != 0 or not found:
+        raise BadgeToolError("Could not read the badge's .mpy version: {}".format(
+            mpremote_error(result)))
+    loads = int(found.group(1))
+    if loads != writes:
+        raise BadgeToolError(
+            "mpy-cross writes .mpy v{} but the badge's MicroPython {}. Flash "
+            "current firmware, install a matching mpy-cross, or pass "
+            "--no-compile.".format(writes, "loads v{}".format(loads) if loads
+                                   else "is too old to report its version"))
+    print("Precompiling modules to .mpy v{} (the badge's version).".format(writes))
+
+
+def remove_replaced_sources(port: str | None, paths: list[str]) -> None:
+    """Delete the .py files that uploaded .mpy files replace, because
+    MicroPython imports a .py in preference to a .mpy of the same name."""
+    if not paths:
+        return
+    result = run(mpremote_prefix(port)
+                 + ["exec", REMOVE_FILES_CODE.format(paths=paths)],
+                 check=False, capture=True, timeout=60)
+    if "BADGE_REMOVED" not in result.stdout:
+        raise BadgeToolError(
+            "Uploaded .mpy files, but could not delete the .py files they "
+            "replace, which the badge would keep running: {}".format(
+                mpremote_error(result)))
 
 
 def remove_remote_sponsor_logos(port: str | None) -> None:
@@ -346,16 +453,24 @@ def battery_voltage_line(port: str | None,
     return line
 
 
-def upload_tree(port: str | None, config: dict[str, Any]) -> str | None:
+def upload_tree(port: str | None, config: dict[str, Any],
+                compile_modules: bool) -> str | None:
     removed = clean_bytecode_cache()
     if removed:
         print("Removed {} Python cache entries.".format(removed))
     files = upload_files()
+    if compile_modules:
+        check_mpy_compatible(port)
     with tempfile.TemporaryDirectory(prefix="bsides-badge-upload-") as temp_dir:
-        entries = stage_upload_files(files, Path(temp_dir))
+        entries, replaced = stage_upload_files(files, Path(temp_dir),
+                                               compile_modules)
+        # Only once nothing can refuse the upload, so a refused upload does
+        # not leave the badge without its logos.
+        remove_remote_sponsor_logos(port)
         if entries:
             run(mpremote_prefix(port) + ["fs", "cp", "-r"]
                 + [str(path) for path in entries] + [":"])
+    remove_replaced_sources(port, replaced)
     write_remote_config(port, config)
 
     for stale_file in LEGACY_FILES + OBSOLETE_FILES:
@@ -363,7 +478,8 @@ def upload_tree(port: str | None, config: dict[str, Any]) -> str | None:
             capture=True, timeout=20)
     battery_line = battery_voltage_line(port, config)
     run(mpremote_prefix(port) + ["reset"], check=False, timeout=20)
-    print("Uploaded {} firmware files and badge.json.".format(len(files)))
+    print("Uploaded {} firmware files ({} precompiled) and badge.json.".format(
+        len(files), len(replaced)))
     return battery_line
 
 
@@ -442,25 +558,28 @@ def detect_badge_version(args: argparse.Namespace, port: str | None,
 
 
 def command_init(args: argparse.Namespace) -> None:
-    ensure_tools(install=True)
+    ensure_tools(install=True, tools=ALL_TOOLS)
     firmware = latest_firmware()
     path = download_firmware(firmware, args.firmware_dir)
     print("Ready: MicroPython {} at {}".format(firmware.version, path))
 
 
+def upload_tools(args: argparse.Namespace) -> tuple[str, ...]:
+    return BASE_TOOLS if args.no_compile else ALL_TOOLS
+
+
 def command_upload(args: argparse.Namespace) -> str | None:
-    ensure_tools(install=False)
+    ensure_tools(install=False, tools=upload_tools(args))
     port = detect_port(args.port)
     maybe_check_firmware(port, args.skip_version_check)
     remote = existing_config(port, args.wipe)
     version = detect_badge_version(args, port, remote)
     config = merge_config(remote, version, args.holder_name, not args.no_git_info)
-    remove_remote_sponsor_logos(port)
-    return upload_tree(port, config)
+    return upload_tree(port, config, not args.no_compile)
 
 
 def command_flash(args: argparse.Namespace) -> str | None:
-    ensure_tools(install=True)
+    ensure_tools(install=True, tools=upload_tools(args))
     firmware = latest_firmware()
     image = download_firmware(firmware, args.firmware_dir)
     port = detect_port(args.port)
@@ -477,7 +596,7 @@ def command_flash(args: argparse.Namespace) -> str | None:
     run(esptool + port_args + ["--baud", str(args.baud), "write-flash", "0", str(image)])
     print("Waiting for MicroPython to start...")
     time.sleep(2)
-    battery_line = upload_tree(port, config)
+    battery_line = upload_tree(port, config, not args.no_compile)
     print("Full flash complete with MicroPython {}.".format(firmware.version))
     return battery_line
 
@@ -612,6 +731,14 @@ def add_connection_options(parser: argparse.ArgumentParser, *, version: bool = F
             help="hardware version (detected from the badge by default)")
 
 
+def add_upload_options(parser: argparse.ArgumentParser) -> None:
+    add_metadata_options(parser)
+    parser.add_argument(
+        "--no-compile", action="store_true",
+        help="upload .py sources instead of precompiled .mpy; the badge then "
+             "compiles them itself, which leaves much less RAM for Wi-Fi")
+
+
 def add_metadata_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--holder-name", help="also set the holder name")
     parser.add_argument("--no-git-info", action="store_true",
@@ -631,13 +758,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     upload = subparsers.add_parser("upload", help="upload application files")
     add_connection_options(upload, version=True)
-    add_metadata_options(upload)
+    add_upload_options(upload)
     upload.add_argument("--skip-version-check", action="store_true")
     upload.set_defaults(handler=command_upload)
 
     flash = subparsers.add_parser("flash", help="erase, flash latest MicroPython, and upload files")
     add_connection_options(flash, version=True)
-    add_metadata_options(flash)
+    add_upload_options(flash)
     flash.add_argument("--firmware-dir", type=Path, default=DEFAULT_FIRMWARE_DIR)
     flash.add_argument("--baud", type=int, default=460800)
     flash.set_defaults(handler=command_flash)

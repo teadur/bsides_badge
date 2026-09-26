@@ -92,9 +92,12 @@ consistent across platforms.
 sudo usermod -aG dialout "$USER"
 ```
 
-Initialize the workstation. This installs missing `esptool` and `mpremote`
-packages and downloads the newest stable `ESP32_GENERIC_C3` MicroPython image.
-If `init` fails on your Linux machine, try installing `esptool` and `mpremote` via `pipx`.
+Initialize the workstation. This installs missing `esptool`, `mpremote` and
+`mpy-cross` packages and downloads the newest stable `ESP32_GENERIC_C3`
+MicroPython image. If `init` fails on your Linux machine, try installing the
+three tools via `pipx`. In a virtual environment (for example one made by `uv`),
+install them into it instead: `uv pip install esptool mpremote mpy-cross`, or
+`make tools`.
 
 ```console
 python scripts/badge.py init
@@ -142,6 +145,18 @@ erased) needs `--badge-version`.
 The `upload` command replaces the badge's entire `/logos` directory with the
 current sponsor set, so logos removed from the repository do not remain on the
 badge.
+
+`flash` and `upload` precompile every module except `main.py` and `boot.py`
+to `.mpy` bytecode with `mpy-cross` before copying it. Compiling a `.py` file
+on the badge needs several times its size in RAM, and the Python heap never
+gives that peak back, which leaves too little memory for Wi-Fi. Because
+MicroPython imports a `.py` file in preference to a `.mpy` file of the same
+name, the tool then deletes the `.py` copies an earlier upload left behind. It
+also writes `games/index.json` with each game's name, since the menu cannot
+read `GAME_NAME` from a `.mpy` file. Before compiling, the tool checks that
+the badge's MicroPython loads the `.mpy` version that `mpy-cross` writes, and
+stops if not; an incompatible `.mpy` would keep the badge from starting. Pass
+`--no-compile` to upload `.py` sources as before.
 
 Set or change the holder's name:
 
@@ -193,7 +208,9 @@ For several badges at once, the `Makefile` wraps these commands. It runs
 ports in `PORTS` (default `/dev/ttyACM0 /dev/ttyACM1`):
 
 ```console
+make tools                            # install esptool, mpremote, mpy-cross
 make upload                           # upload to every badge, version detected
+make upload NO_COMPILE=1              # ...as .py sources instead of .mpy
 make badge-test                       # Wi-Fi test on all badges + logs + report
 make wifi-check                       # upload, then badge-test
 make logs                             # only save every badge's link log
@@ -236,7 +253,17 @@ running Tic-tac-toe.
 The link log records ESP-NOW start-up (channel and MAC address, or the
 exact error), every beacon and frame received with its signal strength,
 badges appearing, disappearing and returning, and all Tic-tac-toe link
-traffic. Every line also goes to the serial console and to `/linklog.txt` on
+traffic. At every start-up it also records free memory twice: `boot wifi
+reserved` before the menu loads and `boot menu ready` after, each with the
+Python heap's free space (`mp free`) and the free space outside it that
+Wi-Fi uses (`idf free`, `largest` block).
+
+A Wi-Fi send fails with `ESP_ERR_ESPNOW_NO_MEM` when the Wi-Fi driver has no
+memory left for it. MicroPython keeps retrying such a send for 2 seconds, and
+nothing else on the badge runs meanwhile, so after a failed send Tic-tac-toe
+and WiFi neighbours skip sending for 5 seconds. The log gets one line per
+failure, with the free memory at that moment, and one line when sending
+works again. Every line also goes to the serial console and to `/linklog.txt` on
 the badge. That file is limited to 16 KiB; when it is full it becomes
 `/linklog.old.txt`, so up to 32 KiB of history survives restarts. Writes are
 batched (every 16 lines or 2 seconds) to limit flash wear. Use
@@ -249,8 +276,8 @@ received (`rx`) lines appear on at least one side.
 
 ## Games
 
-Open **Menu -> Games** to select an installed game. The menu discovers Python
-files in `software/games` at runtime. Flappy Bird, Pacman, Snake, Tetris, and
+Open **Menu -> Games** to select an installed game. The menu discovers the
+games in `software/games` at runtime. Flappy Bird, Pacman, Snake, Tetris, and
 the two-player games Pong and Tic-tac-toe are included.
 
 To add a game, place a `.py` file in `software/games`. It must export:
@@ -261,7 +288,9 @@ GameScreen = MyGameScreen
 ```
 
 The menu reads `GAME_NAME` from the file without importing the game, so it
-must be a plain string literal at the start of its own line. Only the game
+must be a plain string literal at the start of its own line. For precompiled
+games the upload tool reads that line on your computer and stores the names in
+`games/index.json` on the badge. Only the game
 you open is imported; any previously opened game is unloaded first, and all
 games are unloaded when you leave the Games menu. This keeps memory free for
 games. The Wi-Fi driver's memory is reserved once at boot, before the menu

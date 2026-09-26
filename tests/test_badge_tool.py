@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import subprocess
 import sys
 import tempfile
@@ -142,7 +143,7 @@ class BadgeToolTests(unittest.TestCase):
         files = [badge_tool.SOFTWARE_DIR / "main.py",
                  badge_tool.SOFTWARE_DIR / "games" / "snake.py"]
         with patch.object(badge_tool, "upload_files", return_value=files):
-            badge_tool.upload_tree("/dev/ttyACM0", {})
+            badge_tool.upload_tree("/dev/ttyACM0", {}, compile_modules=False)
         copy_commands = [call.args[0] for call in run.call_args_list
                          if "cp" in call.args[0]]
         self.assertEqual(len(copy_commands), 1)
@@ -191,22 +192,28 @@ class BadgeToolTests(unittest.TestCase):
                     command, "--badge-version", "2026", "--wipe"])
                 self.assertTrue(args.wipe)
 
-    @patch.object(badge_tool, "probe_hardware", return_value="2026")
-    @patch.object(badge_tool, "upload_tree", return_value=None)
+    @patch.object(badge_tool, "write_remote_config")
+    @patch.object(badge_tool, "run")
     @patch.object(badge_tool, "remove_remote_sponsor_logos")
-    @patch.object(badge_tool, "merge_config", return_value={})
-    @patch.object(badge_tool, "existing_config", return_value={})
-    @patch.object(badge_tool, "maybe_check_firmware")
-    @patch.object(badge_tool, "detect_port", return_value="COM10")
-    @patch.object(badge_tool, "ensure_tools")
+    @patch.object(badge_tool, "clean_bytecode_cache", return_value=0)
     def test_upload_replaces_sponsor_logos(
-            self, _ensure, _detect, _check, _existing, _merge,
-            remove_logos, _upload_tree, _probe):
-        args = Namespace(
-            badge_version="2026", port=None, skip_version_check=False,
-            wipe=False, holder_name=None, no_git_info=False)
-        badge_tool.command_upload(args)
+            self, _clean, remove_logos, _run, _write_config):
+        with patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"]):
+            badge_tool.upload_tree("COM10", {}, compile_modules=False)
         remove_logos.assert_called_once_with("COM10")
+
+    @patch.object(badge_tool, "run")
+    @patch.object(badge_tool, "remove_remote_sponsor_logos")
+    @patch.object(badge_tool, "clean_bytecode_cache", return_value=0)
+    def test_refused_upload_keeps_the_sponsor_logos(
+            self, _clean, remove_logos, run):
+        refused = badge_tool.BadgeToolError("mpy-cross writes .mpy v6 ...")
+        with patch.object(badge_tool, "check_mpy_compatible",
+                          side_effect=refused), \
+                self.assertRaises(badge_tool.BadgeToolError):
+            badge_tool.upload_tree("COM10", {}, compile_modules=True)
+        remove_logos.assert_not_called()
+        run.assert_not_called()
 
 
 class HardwareDetectionTests(unittest.TestCase):
@@ -314,6 +321,157 @@ class HardwareDetectionTests(unittest.TestCase):
                 self.assertRaises(badge_tool.BadgeToolError):
             badge_tool.command_flash(args)
         run.assert_not_called()
+
+
+HAVE_MPY_CROSS = badge_tool.tool_command("mpy-cross") is not None
+
+
+def fake_mpy_cross(version_line):
+    """A stand-in mpy-cross command that only answers --version."""
+    return [sys.executable, "-c", "print({!r})".format(version_line)]
+
+
+def badge_run(mpy="6", removed=True, copied=None):
+    """A fake run() answering the .mpy version and file-removal execs.
+
+    Records into copied whether each path given to fs cp exists."""
+    def run(command, **_kwargs):
+        if copied is not None and command[1:3] == ["fs", "cp"]:
+            copied.extend((Path(p).name, Path(p).exists())
+                          for p in command[4:-1])
+        stdout = ""
+        if "BADGE_MPY" in command[-1]:
+            stdout = "BADGE_MPY={}\r\n".format(mpy)
+        elif "BADGE_REMOVED" in command[-1] and removed:
+            stdout = "BADGE_REMOVED\r\n"
+        return Namespace(returncode=0, stdout=stdout, stderr="")
+    return run
+
+
+class PrecompileTests(unittest.TestCase):
+    @patch.object(badge_tool.shutil, "which", return_value=None)
+    @patch.object(badge_tool.importlib.util, "find_spec")
+    def test_mpy_cross_is_found_as_its_python_module(self, find_spec, _which):
+        find_spec.side_effect = lambda name: object() if name == "mpy_cross" else None
+        self.assertEqual(badge_tool.tool_command("mpy-cross"),
+                         [sys.executable, "-m", "mpy_cross"])
+
+    @patch.object(badge_tool, "tool_command", return_value=None)
+    def test_missing_tool_names_the_install_command(self, _tool):
+        with self.assertRaises(badge_tool.BadgeToolError) as caught:
+            badge_tool.ensure_tools(install=False, tools=("mpy-cross",))
+        self.assertIn("uv pip install mpy-cross", str(caught.exception))
+
+    def test_no_compile_option_for_upload_and_flash(self):
+        parser = badge_tool.build_parser()
+        for command in ("upload", "flash"):
+            with self.subTest(command=command):
+                self.assertFalse(parser.parse_args([command]).no_compile)
+                self.assertTrue(
+                    parser.parse_args([command, "--no-compile"]).no_compile)
+                self.assertEqual(
+                    badge_tool.upload_tools(parser.parse_args([command])),
+                    ("esptool", "mpremote", "mpy-cross"))
+
+    @unittest.skipUnless(HAVE_MPY_CROSS, "mpy-cross is not installed")
+    def test_staging_compiles_modules_but_keeps_main_and_boot_as_source(self):
+        software = badge_tool.SOFTWARE_DIR
+        files = [software / name for name in (
+            "boot.py", "main.py", "linklog.py", "certs/isrg-root-x1.pem",
+            "games/snake.py", "games/tictactoe.py", "logos/bolt.py")]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            entries, replaced = badge_tool.stage_upload_files(files, root, True)
+            staged = sorted(p.relative_to(root).as_posix()
+                            for p in root.rglob("*") if p.is_file())
+            ttt = (root / "games" / "tictactoe.mpy").read_bytes()
+            index = json.loads((root / "games" / "index.json").read_text())
+            self.assertEqual((root / "main.py").read_bytes(),
+                             (software / "main.py").read_bytes())
+        self.assertEqual(staged, [
+            "boot.py", "certs/isrg-root-x1.pem", "games/index.json",
+            "games/snake.mpy", "games/tictactoe.mpy", "linklog.mpy",
+            "logos/bolt.mpy", "main.py"])
+        self.assertEqual(replaced, ["/linklog.py", "/games/snake.py",
+                                    "/games/tictactoe.py", "/logos/bolt.py"])
+        self.assertEqual([e.name for e in entries],
+                         ["boot.py", "certs", "games", "linklog.mpy", "logos",
+                          "main.py"])
+        self.assertEqual(ttt[:2], b"M\x06")            # .mpy format v6
+        self.assertIn(b"games/tictactoe.py", ttt)     # traceback file name
+        self.assertEqual(index["tictactoe"], "Tic-tac-toe")
+        self.assertEqual(index["snake"], "Snake")
+
+    @unittest.skipUnless(HAVE_MPY_CROSS, "mpy-cross is not installed")
+    @patch.object(badge_tool, "write_remote_config")
+    @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+    @patch.object(badge_tool, "clean_bytecode_cache", return_value=0)
+    @patch("builtins.print")
+    def test_upload_checks_the_badge_then_removes_replaced_sources(
+            self, _print, _clean, _prefix, _write_config):
+        files = [badge_tool.SOFTWARE_DIR / "main.py",
+                 badge_tool.SOFTWARE_DIR / "linklog.py",
+                 badge_tool.SOFTWARE_DIR / "games" / "snake.py"]
+        copied = []
+        with patch.object(badge_tool, "upload_files", return_value=files), \
+                patch.object(badge_tool, "run",
+                             side_effect=badge_run(copied=copied)) as run:
+            badge_tool.upload_tree("/dev/ttyACM0", {}, compile_modules=True)
+        commands = [c.args[0] for c in run.call_args_list]
+        steps = ["mpy check" if "BADGE_MPY" in c[-1] else
+                 "remove" if "BADGE_REMOVED" in c[-1] else " ".join(c[1:4])
+                 for c in commands]
+        self.assertEqual(steps[:4], ["mpy check", "fs rm -r", "fs cp -r",
+                                     "remove"])
+        self.assertEqual(copied, [("games", True), ("linklog.mpy", True),
+                                  ("main.py", True)])
+        self.assertIn("'/games/snake.py'", commands[3][-1])
+        self.assertIn("'/linklog.py'", commands[3][-1])
+        self.assertNotIn("main.py", commands[3][-1])
+
+    @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+    def test_mismatched_mpy_version_stops_before_uploading(self, _prefix):
+        writes_v6 = fake_mpy_cross(
+            "MicroPython v1.29.0; mpy-cross emitting mpy v6.3")
+        for badge, expected in (("7", "loads v7"),
+                                ("0", "too old to report its version")):
+            with self.subTest(badge=badge), \
+                    patch.object(badge_tool, "tool_command",
+                                 return_value=writes_v6), \
+                    patch.object(badge_tool, "run",
+                                 side_effect=badge_run(mpy=badge)) as run, \
+                    self.assertRaises(badge_tool.BadgeToolError) as caught:
+                badge_tool.check_mpy_compatible("/dev/ttyACM0")
+            self.assertIn("writes .mpy v6", str(caught.exception))
+            self.assertIn(expected, str(caught.exception))
+            self.assertEqual(len(run.call_args_list), 1)
+
+    @patch("builtins.print")
+    @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+    def test_matching_mpy_version_passes(self, _prefix, _print):
+        writes_v6 = fake_mpy_cross("mpy-cross emitting mpy v6.3")
+        with patch.object(badge_tool, "tool_command", return_value=writes_v6), \
+                patch.object(badge_tool, "run", side_effect=badge_run(mpy="6")):
+            badge_tool.check_mpy_compatible("/dev/ttyACM0")
+
+    @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+    def test_sources_left_behind_are_an_error(self, _prefix):
+        with patch.object(badge_tool, "run",
+                          side_effect=badge_run(removed=False)), \
+                self.assertRaises(badge_tool.BadgeToolError) as caught:
+            badge_tool.remove_replaced_sources("/dev/ttyACM0", ["/bsides.py"])
+        self.assertIn("keep running", str(caught.exception))
+
+    def test_remove_code_runs_and_tolerates_missing_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            present = Path(temp_dir) / "gone.py"
+            present.write_text("x = 1\n")
+            code = badge_tool.REMOVE_FILES_CODE.format(
+                paths=[str(present), str(Path(temp_dir) / "never.py")])
+            result = subprocess.run([sys.executable, "-c", code], check=True,
+                                    capture_output=True, text=True)
+            self.assertFalse(present.exists())
+        self.assertEqual(result.stdout.strip(), "BADGE_REMOVED")
 
 
 class LogsCommandTests(unittest.TestCase):

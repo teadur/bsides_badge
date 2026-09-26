@@ -1,14 +1,15 @@
 """BSides badge user interface and application entry point."""
 
 import sys
-import os
 import gc
 import uasyncio as asyncio
 import time, micropython
 from machine import Pin, I2C, RTC
 import ssd1306
 import bsides_logo
+import espnow_link
 import game_loader
+import linklog
 import rgb_leds
 from badge_config import (
     format_device_id, hardware_for, load_badge_config, save_badge_config)
@@ -647,17 +648,19 @@ class BadgeScreen(ListScreen):
 LOGO_FOLDER = "logos"
 
 
+def sponsor_logo_modules():
+    """Logo module names, whether uploaded as .py or precompiled .mpy."""
+    try:
+        return sorted(game_loader.module_files(LOGO_FOLDER))
+    except OSError:
+        return []
+
+
 def unload_sponsor_logos():
     """Evict generated logo modules and release their framebuffer bytearrays."""
-    try:
-        filenames = os.listdir(LOGO_FOLDER)
-    except OSError:
-        filenames = ()
-    for filename in filenames:
-        if filename.endswith(".py"):
-            module_name = filename[:-3]
-            if module_name in sys.modules:
-                del sys.modules[module_name]
+    for module_name in sponsor_logo_modules():
+        if module_name in sys.modules:
+            del sys.modules[module_name]
     gc.collect()
 
 class SponsorsScreen(Screen):
@@ -669,9 +672,7 @@ class SponsorsScreen(Screen):
         if LOGO_FOLDER not in sys.path:
             sys.path.append(LOGO_FOLDER)
         unload_sponsor_logos()
-        self.logo_modules = sorted(
-            filename[:-3] for filename in os.listdir(LOGO_FOLDER)
-            if filename.endswith(".py"))
+        self.logo_modules = sponsor_logo_modules()
         self.current_logo = 0
         if not self.logo_modules:
             raise RuntimeError("No valid logos found!")
@@ -947,6 +948,9 @@ async def main():
     load_params()
     show_bsides_logo(oled)
     print("Username: {}".format(USERNAME))
+    # Compare with the boot "wifi reserved" line: what loading the UI cost.
+    gc.collect()
+    linklog.log("boot", "menu ready,", espnow_link.memory())
 
     tasks = [
         ui_task(oled), inactivity_task(oled),

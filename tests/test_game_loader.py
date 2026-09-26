@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -40,6 +41,43 @@ class RealGamesTests(unittest.TestCase):
             ("Tic-tac-toe", "tictactoe")])
         self.assertFalse({m for m in set(sys.modules) - before
                           if "games" in m})
+
+
+class PrecompiledGamesTests(unittest.TestCase):
+    def listing(self, files):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name, content in files.items():
+                (Path(temp_dir) / name).write_text(content, encoding="utf-8")
+            return loader.discover(temp_dir)
+
+    def test_mpy_games_are_named_from_the_index(self):
+        games = self.listing({
+            "alpha.py": "GAME_NAME = 'Alpha'\n",
+            "beta.mpy": "",
+            "gamma.mpy": "",                   # missing from the index
+            "delta.py": "GAME_NAME = 'Delta source'\n",
+            "delta.mpy": "",                   # import loads the .py
+            "_private.mpy": "",
+            "index.json": json.dumps({"beta": "Beta", "delta": "Delta index",
+                                      "gone": "Gone"}),
+        })
+        self.assertEqual(games, [("Alpha", "alpha"), ("Beta", "beta"),
+                                 ("Delta source", "delta")])
+
+    def test_missing_or_broken_index_skips_only_mpy_games(self):
+        for index in (None, "{not json", "[1, 2]"):
+            files = {"alpha.py": "GAME_NAME = 'Alpha'\n", "beta.mpy": ""}
+            if index is not None:
+                files["index.json"] = index
+            with self.subTest(index=index):
+                self.assertEqual(self.listing(files), [("Alpha", "alpha")])
+
+    def test_module_files_reports_what_import_would_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for name in ("a.py", "a.mpy", "b.mpy", "c.py", "notes.txt"):
+                (Path(temp_dir) / name).write_text("", encoding="utf-8")
+            self.assertEqual(loader.module_files(temp_dir),
+                             {"a": ".py", "b": ".mpy", "c": ".py"})
 
 
 class LoadGameTests(unittest.TestCase):

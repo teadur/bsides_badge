@@ -123,6 +123,8 @@ class TicTacToeScreen:
                                  rx=machine.Pin(UART_RX), timeout=0)
         # None falls back to cable-only; the reason is in the link log.
         self.espnow, _mac = espnow_link.open_link("ttt", self.my_id)
+        self._radio = (espnow_link.Broadcaster(self.espnow, "ttt")
+                       if self.espnow is not None else None)
 
         self.running = True
         self.peer_id = None
@@ -208,15 +210,10 @@ class TicTacToeScreen:
 
     # ---------- link ----------
     def _send(self, payload):
-        self._dbg("tx", "uart+espnow" if self.espnow is not None else "uart",
-                   payload)
         frame = encode(payload)
         self.uart.write(frame + b"\n")
-        if self.espnow is not None:
-            try:
-                self.espnow.send(espnow_link.BROADCAST, frame)
-            except OSError as exc:
-                linklog.log("ttt", "espnow send failed:", repr(exc))
+        sent = self._radio is not None and self._radio.send(frame)
+        self._dbg("tx", "uart+espnow" if sent else "uart", payload)
 
     def _send_hello(self, need):
         self._send(("H%s,%d,%d" % (self.my_id, 1 if need else 0,

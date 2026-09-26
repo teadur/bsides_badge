@@ -1,15 +1,40 @@
 """List games without importing them, and keep at most one game loaded.
 
-Importing every game just to show its name kept all of them compiled in RAM,
+Importing every game just to show its name kept all of them loaded in RAM,
 which left the Wi-Fi driver too little memory to start ESP-NOW in a game.
 """
 
 import gc
+import json
 import os
 import sys
 
 
 GAMES_FOLDER = "games"
+INDEX = "index.json"      # {module: name}, written by the upload tool
+
+
+def module_files(folder):
+    """Return {module name: ".py" or ".mpy"} for the modules in folder.
+
+    When both files exist, import loads the .py, so that one is reported."""
+    found = {}
+    for filename in os.listdir(folder):
+        if filename.endswith(".mpy"):
+            found.setdefault(filename[:-4], ".mpy")
+        elif filename.endswith(".py"):
+            found[filename[:-3]] = ".py"
+    return found
+
+
+def read_index(folder):
+    try:
+        with open(folder + "/" + INDEX) as f:
+            index = json.load(f)
+    except (OSError, ValueError) as exc:
+        print("Cannot read games index:", exc)
+        return {}
+    return index if isinstance(index, dict) else {}
 
 
 def read_game_name(path):
@@ -26,25 +51,37 @@ def read_game_name(path):
 
 
 def discover(folder=GAMES_FOLDER):
-    """Return (display name, module name) pairs for folder/*.py."""
+    """Return (display name, module name) pairs for the games in folder.
+
+    A game uploaded as source is named by its GAME_NAME line. A precompiled
+    .mpy has no readable source, so its name comes from the index."""
     games = []
     try:
-        filenames = sorted(os.listdir(folder))
+        modules = module_files(folder)
     except OSError as exc:
         print("Cannot scan games directory:", exc)
         return games
-    for filename in filenames:
-        if not filename.endswith(".py") or filename.startswith("_"):
+    index = None
+    for module in sorted(modules):
+        if module.startswith("_"):
             continue
-        try:
-            name = read_game_name(folder + "/" + filename)
-        except OSError as exc:
-            print("Cannot read game {}: {}".format(filename, exc))
-            continue
+        filename = module + modules[module]
+        if modules[module] == ".mpy":
+            if index is None:
+                index = read_index(folder)
+            name = index.get(module)
+            reason = "not in " + INDEX
+        else:
+            try:
+                name = read_game_name(folder + "/" + filename)
+            except OSError as exc:
+                print("Cannot read game {}: {}".format(filename, exc))
+                continue
+            reason = "no GAME_NAME string"
         if name is None:
-            print("Cannot list game {}: no GAME_NAME string".format(filename))
+            print("Cannot list game {}: {}".format(filename, reason))
             continue
-        games.append((name, filename[:-3]))
+        games.append((name, module))
     return games
 
 

@@ -6,6 +6,7 @@
 #
 # Override on the command line, e.g.
 #   make upload PORTS=/dev/ttyACM1 BADGE_VERSION=2026
+#   make upload NO_COMPILE=1          upload .py sources instead of .mpy
 #   make logs CLEAR=1
 
 PORTS ?= /dev/ttyACM0 /dev/ttyACM1
@@ -15,17 +16,22 @@ LOG_DIR = badge-logs
 RUN_STAMP = $(LOG_DIR)/.run-start
 BADGE_VERSION ?=
 CLEAR ?=
+NO_COMPILE ?=
+PIP_INSTALL ?= uv pip install
 
 VERSION_ARG = $(if $(BADGE_VERSION),--badge-version $(BADGE_VERSION))
 CLEAR_ARG = $(if $(CLEAR),--clear)
+COMPILE_ARG = $(if $(NO_COMPILE),--no-compile)
 
 .DEFAULT_GOAL := help
-.PHONY: help upload logs wifi-test badge-test report wifi-check test
+.PHONY: help tools upload logs wifi-test badge-test report wifi-check test
 
 help:
 	@echo "Targets (PORTS=\"$(PORTS)\"):"
-	@echo "  upload      upload application files; hardware version is detected"
-	@echo "              (BADGE_VERSION=2026 overrides)"
+	@echo "  tools       install esptool, mpremote and mpy-cross ($(PIP_INSTALL))"
+	@echo "  upload      upload precompiled application files; hardware version"
+	@echo "              is detected (BADGE_VERSION=2026 overrides, NO_COMPILE=1"
+	@echo "              uploads .py sources)"
 	@echo "  badge-test  run the Wi-Fi test on all badges at once, save their"
 	@echo "              link logs, and bundle the run into one report file"
 	@echo "  wifi-check  upload, then badge-test"
@@ -35,10 +41,13 @@ help:
 	@echo "  report      bundle the files of the last badge-test run again"
 	@echo "  test        run the unit tests"
 
+tools:
+	$(PIP_INSTALL) esptool mpremote mpy-cross
+
 upload:
 	@set -e; for port in $(PORTS); do \
 		echo "=== upload $$port"; \
-		$(BADGE) upload --port $$port $(VERSION_ARG); \
+		$(BADGE) upload --port $$port $(VERSION_ARG) $(COMPILE_ARG); \
 	done
 
 logs:

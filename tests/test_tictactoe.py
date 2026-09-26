@@ -116,7 +116,7 @@ class FakeEspNow:
     def add_peer(self, mac):
         self.peers.add(mac)
 
-    def send(self, mac, msg):
+    def send(self, mac, msg, sync=True):
         self.sent.append(msg)
         if self.peer is not None and self.active_ and self.peer.active_:
             self.peer.inbox.append((b"\x11" * 6, bytes(msg)))
@@ -435,6 +435,24 @@ class LinkedGameTests(unittest.TestCase):
         self.assertIsNone(g.pending)
         self.assertEqual(host2.board, ["-"] * 9)
         self.assertEqual(g.board, ["-"] * 9)
+
+    def test_starved_radio_backs_off_while_the_cable_keeps_playing(self):
+        h, g = self.host, self.guest
+        attempts = []
+
+        def no_memory(_mac, _msg, _sync=True):
+            attempts.append(_Clock.now)
+            raise OSError(-12391, "ESP_ERR_ESPNOW_NO_MEM")
+
+        h.espnow.send = no_memory
+        play_cell(h, 4, [g])
+        pump(self.both, 12000)
+        # The heartbeat alone would try about 48 sends in 12 s.
+        self.assertLessEqual(len(attempts), 3)
+        self.assertEqual((h.phase, g.phase), ("play", "play"))
+        self.assertEqual(g.board[4], "X")
+        play_cell(g, 0, [h])
+        self.assertEqual(h.board[0], "O")
 
     def test_back_releases_the_uart(self):
         self.assertEqual(press(self.host, BTN_BACK), "games")

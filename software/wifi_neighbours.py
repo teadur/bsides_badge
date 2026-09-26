@@ -105,6 +105,8 @@ class WifiNeighboursScreen:
         self._last_render = 0
 
         self.esp, self.mac = espnow_link.open_link("nbr", self.my_id)
+        self.radio = (espnow_link.Broadcaster(self.esp, "nbr")
+                      if self.esp is not None else None)
         if self.esp is not None:
             linklog.log("nbr", "beaconing as", self.my_id, repr(self.name),
                         "every", BEACON_MS, "ms")
@@ -162,11 +164,8 @@ class WifiNeighboursScreen:
         if time.ticks_diff(now, self.last_beacon) < BEACON_MS:
             return
         self.last_beacon = now
-        try:
-            self.esp.send(espnow_link.BROADCAST, beacon(self.my_id, self.name))
+        if self.radio.send(beacon(self.my_id, self.name)):
             self.sent += 1
-        except OSError as exc:
-            linklog.log("nbr", "send failed:", repr(exc))
 
     def _tick(self, now):
         if self.esp is not None:
