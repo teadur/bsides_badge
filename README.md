@@ -341,3 +341,19 @@ see the log on the badge, or save it with `python scripts/badge.py logs`. A
 badge whose log has no `espnow up ch 1 mac ...` line has a radio or firmware
 problem, not a pairing problem. Set `DEBUG_LINK = False` once linking works on
 real hardware.
+
+To test the Wi-Fi link on two uploaded badges without the cable, run the
+scripted game on both at the same time (replace the ports with yours):
+
+```console
+for port in /dev/ttyACM0 /dev/ttyACM1; do
+  python -m mpremote connect "$port" run tests/tictactoe_wifi_pair_hardware.py &
+done; wait
+```
+
+Each badge ignores its UART receiver, links over ESP-NOW, and plays one game
+in which both sides take the first empty cell. Each prints lines starting
+with `TTT-WIFI <device ID>:` ending in `PASS` or `FAIL: <reason>`, plus the
+free memory before and after. This runs outside the menu. To check that Wi-Fi
+also starts from **Games -> Tic-tac-toe**, open the game on both badges
+without the cable and save both logs with `python scripts/badge.py logs`.
