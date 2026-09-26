@@ -360,10 +360,74 @@ def upload_tree(port: str | None, config: dict[str, Any]) -> str | None:
     return battery_line
 
 
-def require_badge_version(value: str | None) -> str:
-    if not value:
-        raise BadgeToolError("--badge-version is required for this command.")
-    return value
+# Read the pins that differ between hardware versions (see hardware/*.pdf):
+# the 2025 prototype's OLED answers at 0x3D, the others at 0x3C; GPIO4 is
+# SELECT with a 5.1k pull-up to 3.3 V on 2025 boards, but the 100k/20k
+# battery divider (0.5-0.7 V) on 2026 boards.
+PROBE_CODE = """from machine import ADC, I2C, Pin
+found = I2C(0, scl=Pin(1), sda=Pin(0)).scan()
+adc = ADC(Pin(4))
+adc.atten(ADC.ATTN_11DB)
+uv = 0
+for _ in range(8):
+    uv += adc.read_uv()
+print('BADGE_PROBE i2c=%s gpio4_mv=%d' % (','.join(str(a) for a in found), uv // 8000))
+"""
+
+
+def classify_hardware(addresses: list[int], gpio4_mv: int) -> str | None:
+    if 0x3D in addresses and 0x3C not in addresses:
+        return "2025_prototype"
+    if 0x3C not in addresses:
+        return None
+    if gpio4_mv >= 1500:
+        return "2025"
+    if 350 <= gpio4_mv <= 1000:
+        return "2026"
+    return None      # e.g. SELECT held down on a 2025 badge
+
+
+def probe_hardware(port: str | None) -> str | None:
+    """Identify the badge from its pins, or None if it cannot be read."""
+    result = run(mpremote_prefix(port) + ["exec", PROBE_CODE], check=False,
+                 capture=True, timeout=20)
+    match = re.search(r"BADGE_PROBE i2c=([\d,]*) gpio4_mv=(\d+)", result.stdout)
+    if result.returncode != 0 or not match:
+        print("Could not probe the badge hardware.")
+        return None
+    addresses = [int(a) for a in match.group(1).split(",") if a]
+    gpio4_mv = int(match.group(2))
+    version = classify_hardware(addresses, gpio4_mv)
+    print("Hardware probe: I2C {}, GPIO4 {} mV -> {}".format(
+        [hex(a) for a in addresses], gpio4_mv, version or "unknown"))
+    return version
+
+
+def resolve_badge_version(explicit: str | None, probed: str | None,
+                          stored: str | None) -> str:
+    """Pick the version to write: --badge-version, then the probe, then badge.json."""
+    if explicit:
+        if probed and probed != explicit:
+            print("Warning: hardware looks like {}, but using --badge-version {}."
+                  .format(probed, explicit))
+        return explicit
+    if probed:
+        if stored and stored != probed:
+            print("Note: badge.json said {}; the hardware is {}.".format(
+                stored, probed))
+        print("Detected badge version {}.".format(probed))
+        return probed
+    if stored in SUPPORTED_BADGES:
+        print("Using badge version {} from badge.json.".format(stored))
+        return stored
+    raise BadgeToolError(
+        "Could not identify the badge hardware; pass --badge-version.")
+
+
+def detect_badge_version(args: argparse.Namespace, port: str | None,
+                         remote: dict[str, Any]) -> str:
+    return resolve_badge_version(args.badge_version, probe_hardware(port),
+                                 remote.get("badge_version"))
 
 
 def command_init(args: argparse.Namespace) -> None:
@@ -375,22 +439,23 @@ def command_init(args: argparse.Namespace) -> None:
 
 def command_upload(args: argparse.Namespace) -> str | None:
     ensure_tools(install=False)
-    version = require_badge_version(args.badge_version)
     port = detect_port(args.port)
     maybe_check_firmware(port, args.skip_version_check)
     remote = existing_config(port, args.wipe)
+    version = detect_badge_version(args, port, remote)
     config = merge_config(remote, version, args.holder_name, not args.no_git_info)
     remove_remote_sponsor_logos(port)
     return upload_tree(port, config)
 
 
 def command_flash(args: argparse.Namespace) -> str | None:
-    version = require_badge_version(args.badge_version)
     ensure_tools(install=True)
     firmware = latest_firmware()
     image = download_firmware(firmware, args.firmware_dir)
     port = detect_port(args.port)
     remote = existing_config(port, args.wipe)
+    # Probe before erasing: a blank chip has no MicroPython to answer.
+    version = detect_badge_version(args, port, remote)
     config = merge_config(remote, version, args.holder_name, not args.no_git_info)
 
     esptool = tool_command("esptool")
@@ -531,7 +596,9 @@ def command_logs(args: argparse.Namespace) -> None:
 def add_connection_options(parser: argparse.ArgumentParser, *, version: bool = False) -> None:
     parser.add_argument("--port", help="serial port (auto-detected by default)")
     if version:
-        parser.add_argument("--badge-version", choices=SUPPORTED_BADGES, required=True)
+        parser.add_argument(
+            "--badge-version", choices=SUPPORTED_BADGES,
+            help="hardware version (detected from the badge by default)")
 
 
 def add_metadata_options(parser: argparse.ArgumentParser) -> None:

@@ -9,4 +9,6 @@ if machine.RTC().memory() == b"wifi_fetch":
 elif machine.Pin(hardware["select_pin"], machine.Pin.IN).value() == 0:
     print("Not starting main application")
 else:
+    import espnow_link
+    espnow_link.reserve_driver()
     import bsides

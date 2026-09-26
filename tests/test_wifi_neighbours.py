@@ -198,6 +198,31 @@ class HelperTests(unittest.TestCase):
         self.assertEqual(nbr.age_text(7200000), ">1h")
 
 
+class ReserveDriverTests(unittest.TestCase):
+    def test_starts_and_stops_the_driver_once(self):
+        calls = []
+
+        class RecordingWLAN(FakeWLAN):
+            def active(self, value=None):
+                calls.append(value)
+
+        net = types.SimpleNamespace(WLAN=RecordingWLAN, STA_IF=0)
+        with patch.object(espnow_link, "network", net):
+            espnow_link.reserve_driver()
+        self.assertEqual(calls, [True, False])
+
+    def test_failure_is_logged_not_raised(self):
+        class FailingWLAN(FakeWLAN):
+            def active(self, value=None):
+                raise OSError("WiFi Out of Memory")
+
+        net = types.SimpleNamespace(WLAN=FailingWLAN, STA_IF=0)
+        with patch.object(espnow_link, "network", net):
+            espnow_link.reserve_driver()
+        self.assertIn("boot wifi reserve failed: OSError('WiFi Out of Memory'",
+                      linklog.lines[-1])
+
+
 class NeighbourScreenTests(unittest.TestCase):
     def setUp(self):
         _Clock.now = 100000

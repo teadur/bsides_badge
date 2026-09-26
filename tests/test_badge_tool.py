@@ -191,6 +191,7 @@ class BadgeToolTests(unittest.TestCase):
                     command, "--badge-version", "2026", "--wipe"])
                 self.assertTrue(args.wipe)
 
+    @patch.object(badge_tool, "probe_hardware", return_value="2026")
     @patch.object(badge_tool, "upload_tree", return_value=None)
     @patch.object(badge_tool, "remove_remote_sponsor_logos")
     @patch.object(badge_tool, "merge_config", return_value={})
@@ -200,12 +201,112 @@ class BadgeToolTests(unittest.TestCase):
     @patch.object(badge_tool, "ensure_tools")
     def test_upload_replaces_sponsor_logos(
             self, _ensure, _detect, _check, _existing, _merge,
-            remove_logos, _upload_tree):
+            remove_logos, _upload_tree, _probe):
         args = Namespace(
             badge_version="2026", port=None, skip_version_check=False,
             wipe=False, holder_name=None, no_git_info=False)
         badge_tool.command_upload(args)
         remove_logos.assert_called_once_with("COM10")
+
+
+class HardwareDetectionTests(unittest.TestCase):
+    def test_classifies_each_version_from_its_pins(self):
+        classify = badge_tool.classify_hardware
+        self.assertEqual(classify([0x3D], 3100), "2025_prototype")
+        self.assertEqual(classify([0x3C], 3100), "2025")      # SELECT pull-up
+        self.assertEqual(classify([0x3C], 2480), "2025")      # 11 dB saturates
+        self.assertEqual(classify([0x3C], 500), "2026")       # 3.0 V battery
+        self.assertEqual(classify([0x3C], 700), "2026")       # 4.2 V battery
+
+    def test_ambiguous_readings_are_not_guessed(self):
+        classify = badge_tool.classify_hardware
+        self.assertIsNone(classify([], 3100))                 # no OLED answered
+        self.assertIsNone(classify([0x3C], 20))               # SELECT held
+        self.assertIsNone(classify([0x3C], 1200))
+
+    @patch("builtins.print")
+    @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+    def test_probe_parses_the_badge_report(self, _prefix, _print):
+        output = Namespace(returncode=0, stderr="",
+                           stdout="BADGE_PROBE i2c=60 gpio4_mv=612\r\n")
+        with patch.object(badge_tool, "run", return_value=output) as run:
+            self.assertEqual(badge_tool.probe_hardware("/dev/ttyACM1"), "2026")
+        self.assertEqual(run.call_args.args[0][:2], ["mpremote", "exec"])
+
+    @patch("builtins.print")
+    @patch.object(badge_tool, "mpremote_prefix", return_value=["mpremote"])
+    def test_probe_failure_returns_none(self, _prefix, _print):
+        output = Namespace(returncode=1, stdout="", stderr="no device")
+        with patch.object(badge_tool, "run", return_value=output):
+            self.assertIsNone(badge_tool.probe_hardware(None))
+
+    def test_probe_code_runs_against_fake_pins(self):
+        """The snippet sent to the badge, run with stand-in machine classes."""
+        fake_machine = (
+            "import sys, types\n"
+            "m = types.ModuleType('machine')\n"
+            "class Pin:\n    def __init__(self, n): pass\n"
+            "class I2C:\n    def __init__(self, *a, **k): pass\n"
+            "    def scan(self): return [60]\n"
+            "class ADC:\n    ATTN_11DB = 3\n"
+            "    def __init__(self, pin): pass\n"
+            "    def atten(self, a): pass\n"
+            "    def read_uv(self): return 612000\n"
+            "m.Pin, m.I2C, m.ADC = Pin, I2C, ADC\n"
+            "sys.modules['machine'] = m\n")
+        result = subprocess.run(
+            [sys.executable, "-c", fake_machine + badge_tool.PROBE_CODE],
+            check=True, capture_output=True, text=True)
+        self.assertEqual(result.stdout.strip(), "BADGE_PROBE i2c=60 gpio4_mv=612")
+
+    @patch("builtins.print")
+    def test_version_precedence(self, print_mock):
+        resolve = badge_tool.resolve_badge_version
+        self.assertEqual(resolve("2025", "2026", "2026"), "2025")
+        self.assertIn("hardware looks like 2026", print_mock.call_args.args[0])
+        self.assertEqual(resolve(None, "2026", "2025"), "2026")
+        self.assertEqual(resolve(None, None, "2025_prototype"), "2025_prototype")
+        with self.assertRaises(badge_tool.BadgeToolError):
+            resolve(None, None, None)
+
+    def test_upload_and_flash_no_longer_require_a_version(self):
+        parser = badge_tool.build_parser()
+        for command in ("upload", "flash"):
+            with self.subTest(command=command):
+                self.assertIsNone(parser.parse_args([command]).badge_version)
+
+    @patch("builtins.print")
+    @patch.object(badge_tool, "upload_tree", return_value=None)
+    @patch.object(badge_tool, "remove_remote_sponsor_logos")
+    @patch.object(badge_tool, "existing_config",
+                  return_value={"badge_version": "2025", "device_id": "A" * 12})
+    @patch.object(badge_tool, "maybe_check_firmware")
+    @patch.object(badge_tool, "detect_port", return_value="/dev/ttyACM1")
+    @patch.object(badge_tool, "ensure_tools")
+    def test_upload_writes_the_detected_version(
+            self, _ensure, _detect, _check, _existing, _logos, upload_tree,
+            _print):
+        args = badge_tool.build_parser().parse_args(["upload", "--no-git-info"])
+        with patch.object(badge_tool, "probe_hardware", return_value="2026"):
+            badge_tool.command_upload(args)
+        config = upload_tree.call_args.args[1]
+        self.assertEqual(config["badge_version"], "2026")
+        self.assertEqual(config["device_id"], "A" * 12)
+
+    @patch("builtins.print")
+    @patch.object(badge_tool, "run")
+    @patch.object(badge_tool, "existing_config", return_value={})
+    @patch.object(badge_tool, "detect_port", return_value="/dev/ttyACM0")
+    @patch.object(badge_tool, "download_firmware", return_value=Path("fw.bin"))
+    @patch.object(badge_tool, "latest_firmware")
+    @patch.object(badge_tool, "ensure_tools")
+    def test_flash_refuses_to_erase_an_unidentified_badge(
+            self, _ensure, _latest, _download, _detect, _existing, run, _print):
+        args = badge_tool.build_parser().parse_args(["flash"])
+        with patch.object(badge_tool, "probe_hardware", return_value=None), \
+                self.assertRaises(badge_tool.BadgeToolError):
+            badge_tool.command_flash(args)
+        run.assert_not_called()
 
 
 class LogsCommandTests(unittest.TestCase):

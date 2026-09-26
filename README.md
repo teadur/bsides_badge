@@ -107,13 +107,13 @@ near the SELECT button).
 Erase the chip, flash that image, and upload the application:
 
 ```console
-python scripts/badge.py flash --badge-version 2026
+python scripts/badge.py flash
 ```
 
 The same with full wipe (no previous settings restored)
 
 ```console
-python scripts/badge.py flash --wipe --badge-version 2026
+python scripts/badge.py flash --wipe
 ```
 
 When reachable before erasing, the tool preserves the badge ID, holder name,
@@ -125,8 +125,19 @@ already empty badge and creates `badge.json` from the repository defaults.
 Upload only application files:
 
 ```console
-python scripts/badge.py upload --badge-version 2026
+python scripts/badge.py upload
 ```
+
+`flash` and `upload` identify the hardware version from the badge itself.
+The 2025 prototype's OLED answers at I2C address 0x3D instead of 0x3C, and
+GPIO4 reads about 3.3 V on 2025 badges (the SELECT button's pull-up) but
+0.5-0.7 V on 2026 badges (the battery voltage divider). The tool prints what
+it measured and the version it chose. If the reading is inconclusive (for
+example, SELECT is held down), it falls back to the version in the badge's
+`badge.json`. Pass `--badge-version 2026` (or `2025`, `2025_prototype`) to
+override the detection; the tool warns if that disagrees with the hardware.
+`flash` probes before erasing, so a badge without MicroPython (brand new or
+erased) needs `--badge-version`.
 
 The `upload` command replaces the badge's entire `/logos` directory with the
 current sponsor set, so logos removed from the repository do not remain on the
@@ -231,8 +242,12 @@ GameScreen = MyGameScreen
 The menu reads `GAME_NAME` from the file without importing the game, so it
 must be a plain string literal at the start of its own line. Only the game
 you open is imported; any previously opened game is unloaded first, and all
-games are unloaded when you leave the Games menu. This keeps enough memory
-free for Wi-Fi (Tic-tac-toe's ESP-NOW link).
+games are unloaded when you leave the Games menu. This keeps memory free for
+games. The Wi-Fi driver's memory is reserved once at boot, before the menu
+loads: its buffers live outside the Python heap, and the heap grows into that
+space as the menu and games load, so starting Wi-Fi for the first time inside
+a game could fail with `WiFi Out of Memory`. The radio stays off until
+Tic-tac-toe or WiFi neighbours turns it on.
 
 `GameScreen(oled)` must provide `render()` and async `handle_button(btn)`
 methods. Set `manages_own_render = True` when the game owns an animation loop.

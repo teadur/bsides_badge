@@ -40,6 +40,24 @@ def memory():
     return text
 
 
+def reserve_driver():
+    """Start and stop the Wi-Fi driver once, before the UI loads.
+
+    The driver allocates its buffers outside the Python heap and keeps them
+    after active(False), while the Python heap grows into that same memory
+    as the UI and games load. A badge that first starts Wi-Fi in a game can
+    find too little left (seen: 35 KB free, 18 KB largest block)."""
+    if network is None:
+        return
+    try:
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        wlan.active(False)
+    except Exception as exc:
+        linklog.log("boot", "wifi reserve failed:", repr(exc), memory())
+        linklog.flush()
+
+
 def open_link(owner, device_id):
     """Return (ESPNow, own MAC) on success, or (None, None).
 
