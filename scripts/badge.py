@@ -450,6 +450,84 @@ def command_name(args: argparse.Namespace) -> str | None:
     return battery_line
 
 
+DEFAULT_LOG_DIR = ROOT / "badge-logs"
+REMOTE_LOG_FILES = ("/linklog.old.txt", "/linklog.txt")
+
+# `resume` keeps the interrupted application's modules loaded, so linklog can
+# flush lines still batched in RAM before the files are read.
+DUMP_LOG_CODE = """import sys
+m = sys.modules.get('linklog')
+if m:
+    m.flush()
+try:
+    import json
+    print('BADGE_LOG_ID ' + json.load(open('/badge.json'))['device_id'])
+except Exception:
+    pass
+for p in {files!r}:
+    try:
+        f = open(p)
+    except OSError:
+        continue
+    print('BADGE_LOG_FILE ' + p)
+    while True:
+        chunk = f.read(512)
+        if not chunk:
+            break
+        sys.stdout.write(chunk)
+    f.close()
+print('BADGE_LOG_END')
+""".format(files=REMOTE_LOG_FILES)
+
+CLEAR_LOG_CODE = """import os
+for p in {files!r}:
+    try:
+        os.remove(p)
+    except OSError:
+        pass
+print('BADGE_LOG_CLEARED')
+""".format(files=REMOTE_LOG_FILES)
+
+
+def parse_log_dump(stdout: str) -> tuple[str | None, str]:
+    """Split DUMP_LOG_CODE output into (device ID, oldest-first log text)."""
+    text = stdout.replace("\r\n", "\n")
+    if "BADGE_LOG_END" not in text:
+        raise BadgeToolError("Could not read the link log from the badge.")
+    match = re.search(r"^BADGE_LOG_ID ([0-9A-Fa-f]{12})$", text, re.MULTILINE)
+    body = text[:text.index("BADGE_LOG_END")]
+    chunks = re.split(r"^BADGE_LOG_FILE \S+\n", body, flags=re.MULTILINE)[1:]
+    log = "".join(chunk if chunk.endswith("\n") else chunk + "\n"
+                  for chunk in chunks if chunk)
+    return (match.group(1).upper() if match else None), log
+
+
+def command_logs(args: argparse.Namespace) -> None:
+    ensure_tools(install=False)
+    port = detect_port(args.port)
+    result = run(mpremote_prefix(port) + ["resume", "exec", DUMP_LOG_CODE],
+                 check=False, capture=True, timeout=60)
+    if result.returncode != 0:
+        raise BadgeToolError("Could not read the link log: {}".format(
+            (result.stderr or result.stdout).strip()))
+    device_id, log = parse_log_dump(result.stdout)
+    if not log:
+        print("The badge has no link log yet.")
+    else:
+        output = args.output or DEFAULT_LOG_DIR / "linklog-{}-{}.txt".format(
+            device_id or "unknown", time.strftime("%Y%m%d-%H%M%S"))
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(log, encoding="utf-8")
+        print("Saved {} log lines to {}".format(log.count("\n"), output))
+        if args.clear:
+            cleared = run(mpremote_prefix(port) + ["exec", CLEAR_LOG_CODE],
+                          check=False, capture=True, timeout=20)
+            if "BADGE_LOG_CLEARED" not in cleared.stdout:
+                raise BadgeToolError("Saved the log, but could not clear it.")
+            print("Cleared the link log on the badge.")
+    run(mpremote_prefix(port) + ["reset"], check=False, timeout=20)
+
+
 def add_connection_options(parser: argparse.ArgumentParser, *, version: bool = False) -> None:
     parser.add_argument("--port", help="serial port (auto-detected by default)")
     if version:
@@ -497,6 +575,15 @@ def build_parser() -> argparse.ArgumentParser:
     name.add_argument("--skip-version-check", action="store_true")
     name.add_argument("--no-git-info", action="store_true")
     name.set_defaults(handler=command_name)
+
+    logs = subparsers.add_parser(
+        "logs", help="save the Wi-Fi link debug log from the badge")
+    add_connection_options(logs)
+    logs.add_argument("--output", type=Path,
+                      help="file to write (default: badge-logs/linklog-<id>-<time>.txt)")
+    logs.add_argument("--clear", action="store_true",
+                      help="delete the log on the badge after saving it")
+    logs.set_defaults(handler=command_logs)
     return parser
 
 

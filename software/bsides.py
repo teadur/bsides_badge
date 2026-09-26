@@ -510,7 +510,13 @@ class StatusScreen(Screen):
         return self
 
 
-utils_screens = [("Stopwatch", StopwatchScreen)]
+def WifiNeighboursScreen(oled):
+    import wifi_neighbours
+    return wifi_neighbours.WifiNeighboursScreen(oled)
+
+
+utils_screens = [("Stopwatch", StopwatchScreen),
+                 ("WiFi neighbours", WifiNeighboursScreen)]
 
 class UtilsScreen(ListScreen):
     def __init__(self, oled):

@@ -1,4 +1,5 @@
 import importlib.util
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -205,6 +206,91 @@ class BadgeToolTests(unittest.TestCase):
             wipe=False, holder_name=None, no_git_info=False)
         badge_tool.command_upload(args)
         remove_logos.assert_called_once_with("COM10")
+
+
+class LogsCommandTests(unittest.TestCase):
+    def dump_output(self, old=None, current=None, badge_json=None):
+        """Run the on-badge dump snippet under CPython against temp files."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            files = {}
+            for name, text in (("linklog.old.txt", old), ("linklog.txt", current)):
+                path = Path(temp_dir) / name
+                if text is not None:
+                    path.write_text(text, encoding="utf-8")
+                files["/" + name] = str(path)
+            code = badge_tool.DUMP_LOG_CODE
+            for remote, local in files.items():
+                code = code.replace(repr(remote), repr(local))
+            json_path = Path(temp_dir) / "badge.json"
+            if badge_json is not None:
+                json_path.write_text(badge_json, encoding="utf-8")
+            code = code.replace("'/badge.json'", repr(str(json_path)))
+            result = subprocess.run([sys.executable, "-c", code], check=True,
+                                    capture_output=True, text=True)
+        return result.stdout.replace("\n", "\r\n")   # as seen over mpremote
+
+    def test_dump_joins_old_then_current_and_reads_the_device_id(self):
+        stdout = self.dump_output(
+            old="--- session start, id A1B2C3D4E5F6 ---\n1.000 ttt old\n",
+            current="2.000 ttt new",
+            badge_json='{"device_id": "a1b2c3d4e5f6"}')
+        device_id, log = badge_tool.parse_log_dump(stdout)
+        self.assertEqual(device_id, "A1B2C3D4E5F6")
+        self.assertEqual(log, "--- session start, id A1B2C3D4E5F6 ---\n"
+                              "1.000 ttt old\n2.000 ttt new\n")
+
+    def test_dump_without_log_files_is_empty(self):
+        device_id, log = badge_tool.parse_log_dump(self.dump_output())
+        self.assertIsNone(device_id)
+        self.assertEqual(log, "")
+
+    def test_truncated_dump_is_an_error(self):
+        with self.assertRaises(badge_tool.BadgeToolError):
+            badge_tool.parse_log_dump("BADGE_LOG_FILE /linklog.txt\r\n1.0 x")
+
+    def run_logs(self, stdout, argv=()):
+        results = [Namespace(returncode=0, stdout=stdout, stderr=""),
+                   Namespace(returncode=0, stdout="BADGE_LOG_CLEARED\r\n",
+                             stderr=""),
+                   Namespace(returncode=0, stdout="", stderr="")]
+        args = badge_tool.build_parser().parse_args(["logs"] + list(argv))
+        with patch.object(badge_tool, "ensure_tools"), \
+                patch.object(badge_tool, "detect_port", return_value="COM10"), \
+                patch.object(badge_tool, "mpremote_prefix",
+                             return_value=["mpremote"]), \
+                patch.object(badge_tool, "run", side_effect=results) as run:
+            args.handler(args)
+        return [c.args[0] for c in run.call_args_list]
+
+    def test_logs_saves_to_output_resumes_session_and_resets(self):
+        stdout = self.dump_output(current="1.000 nbr rx x\n",
+                                  badge_json='{"device_id": "A1B2C3D4E5F6"}')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "out" / "log.txt"
+            commands = self.run_logs(stdout, ["--output", str(output)])
+            self.assertEqual(output.read_text(), "1.000 nbr rx x\n")
+        self.assertEqual(commands[0][:3], ["mpremote", "resume", "exec"])
+        self.assertEqual(commands[-1], ["mpremote", "reset"])
+        self.assertEqual(len(commands), 2)
+
+    def test_logs_default_name_uses_the_device_id(self):
+        stdout = self.dump_output(current="1.000 x\n",
+                                  badge_json='{"device_id": "A1B2C3D4E5F6"}')
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.object(badge_tool, "DEFAULT_LOG_DIR", Path(temp_dir)):
+            self.run_logs(stdout)
+            names = [p.name for p in Path(temp_dir).iterdir()]
+        self.assertEqual(len(names), 1)
+        self.assertTrue(names[0].startswith("linklog-A1B2C3D4E5F6-"))
+
+    def test_logs_clear_removes_the_badge_log_after_saving(self):
+        stdout = self.dump_output(current="1.000 x\n")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            commands = self.run_logs(
+                stdout, ["--output", str(Path(temp_dir) / "l.txt"), "--clear"])
+        self.assertEqual(commands[1][:2], ["mpremote", "exec"])
+        self.assertIn("os.remove(p)", commands[1][2])
+        self.assertEqual(commands[2], ["mpremote", "reset"])
 
 
 if __name__ == "__main__":

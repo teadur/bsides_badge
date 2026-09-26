@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import random
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -185,6 +186,17 @@ def _install_stubs():
     time_stub.ticks_diff = _Clock.ticks_diff
     time_stub.ticks_add = _Clock.ticks_add
     sys.modules["time"] = time_stub
+
+    for name in ("linklog", "espnow_link"):
+        spec = importlib.util.spec_from_file_location(
+            name, ROOT / "software" / (name + ".py"))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    log_dir = Path(tempfile.mkdtemp(prefix="ttt-linklog-"))
+    sys.modules["linklog"].LOG_PATH = str(log_dir / "linklog.txt")
+    sys.modules["linklog"].OLD_PATH = str(log_dir / "linklog.old.txt")
+    sys.modules["linklog"].print = lambda *args, **kwargs: None
 
 
 _install_stubs()
@@ -452,10 +464,18 @@ class EspNowLinkTests(unittest.TestCase):
         self.assertEqual(h.board[4], "X")
         self.assertEqual(h.board[0], "O")
 
+    def test_link_events_reach_the_persisted_link_log(self):
+        ttt.linklog.flush()
+        text = Path(ttt.linklog.LOG_PATH).read_text()
+        self.assertIn("ttt espnow up ch 1 mac 02:00:00:00:00:01", text)
+        self.assertIn("ttt phase link -> play", text)
+        self.assertIn("ttt hello from " + LOW_ID, text)
+        self.assertIn("ttt rx espnow(11:11:11:11:11:11) S", text)
+
     def test_falls_back_to_uart_when_espnow_is_unavailable(self):
         """No espnow module (older firmware, no Wi-Fi radio, ...) -> the
         cable-only path from before this feature still works unmodified."""
-        with patch.object(ttt, "espnow", None):
+        with patch.object(ttt.espnow_link, "espnow", None):
             h, g = make(HIGH_ID), make(LOW_ID)
         self.assertIsNone(h.espnow)
         self.assertIsNone(g.espnow)

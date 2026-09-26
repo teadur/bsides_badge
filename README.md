@@ -144,6 +144,20 @@ Delete every file from the MicroPython filesystem (not recoverable):
 python scripts/badge.py delete
 ```
 
+Save the Wi-Fi link debug log (see [WiFi neighbours](#wifi-neighbours)) from
+the badge:
+
+```console
+python scripts/badge.py logs
+python scripts/badge.py logs --output my-run.txt --clear
+```
+
+By default the log is written to `badge-logs/linklog-<device ID>-<time>.txt`
+(ignored by git). The command first flushes lines the running application
+still holds in RAM, then saves the previous and current log file oldest
+first. `--clear` deletes the log on the badge after it has been saved. The
+badge restarts afterwards.
+
 The tool auto-detects a likely ESP32 serial port. If detection is ambiguous,
 pass `--port COM4`, `--port /dev/ttyACM0`, or the relevant macOS
 `/dev/cu.usbmodem*` path after the command name. Upload and name operations check
@@ -167,6 +181,39 @@ Run `python scripts/badge.py --help` or a subcommand with `--help` for all
 options. After a successful operation on a 2026 badge, the tool prints the
 currently measured battery voltage as its final output line. It adds
 `WARNING!!` when the voltage is below 3.8 V or above 4.2 V.
+
+## WiFi neighbours
+
+**Menu -> Utils -> WiFi neighbours** is a proof of concept for badge-to-badge
+Wi-Fi. It turns on broadcast ESP-NOW on channel 1, the same channel
+Tic-tac-toe uses, and sends a beacon with the badge ID and holder name once a
+second. It lists every badge it hears: other badges on this screen and badges
+running Tic-tac-toe.
+
+- The list shows the last eight characters of each badge ID (or `m` and the
+  end of its MAC address if the sender is unknown), the signal strength in
+  dBm, and how long ago it was last heard. The header counts badges heard in
+  the last ten seconds.
+- SELECT switches to the debug console and back. The console shows the Wi-Fi
+  link log, including anything Tic-tac-toe logged earlier since the last
+  restart.
+- NEXT and PREV scroll. The console follows new lines while it is scrolled to
+  the bottom.
+- BACK turns the radio off and returns to Utils.
+
+The link log records ESP-NOW start-up (channel and MAC address, or the
+exact error), every beacon and frame received with its signal strength,
+badges appearing, disappearing and returning, and all Tic-tac-toe link
+traffic. Every line also goes to the serial console and to `/linklog.txt` on
+the badge. That file is limited to 16 KiB; when it is full it becomes
+`/linklog.old.txt`, so up to 32 KiB of history survives restarts. Writes are
+batched (every 16 lines or 2 seconds) to limit flash wear. Use
+`python scripts/badge.py logs` to save it on a computer.
+
+If a badge shows **Radio failed**, press SELECT: the console shows why the
+radio could not start. If two badges both show Wi-Fi as up but neither lists
+the other, compare their logs: check that both report channel 1, and that
+received (`rx`) lines appear on at least one side.
 
 ## Games
 
@@ -276,14 +323,15 @@ the other: whichever one is up carries the game, and since every message is
 guarded by the current game number, the same message arriving twice (once per
 link) is ignored rather than double-applied.
 
-This is a proof of concept for the Wi-Fi side: neither badge joins an access
-point, so both radios are pinned to a fixed channel (`ESPNOW_CHANNEL` in
-`tictactoe.py`, currently channel 1) since ESP-NOW otherwise has nothing to
-make them agree on one. `DEBUG_LINK` in the same file (on by default while
-this is being shaken out on hardware) prints every link lifecycle event -
-ESP-NOW bring-up (or why it failed), phase changes, handshake content, and
-every frame sent or received on both the cable and the radio - to the serial
-console. Watch it with the badge tool's underlying `mpremote <port> repl`.
-A badge that never prints "espnow up: channel ..., mac ..." has a radio or
-firmware problem, not a peer-discovery one - that line alone answers most
-"no peer found" reports. Set `DEBUG_LINK = False` once linking is confirmed.
+The Wi-Fi side is a proof of concept. No badge joins an access point, so both
+radios are set to a fixed channel (`CHANNEL` in `software/espnow_link.py`,
+currently channel 1); otherwise ESP-NOW has nothing that makes the two
+badges use the same channel. While `DEBUG_LINK` in `tictactoe.py` is on (the
+default for now), the game adds phase changes, hello contents, and every
+frame sent or received on both the cable and the radio to the
+[link log](#wifi-neighbours). ESP-NOW start-up and errors are always logged.
+After a failed pairing, open **Utils -> WiFi neighbours** and press SELECT to
+see the log on the badge, or save it with `python scripts/badge.py logs`. A
+badge whose log has no `espnow up ch 1 mac ...` line has a radio or firmware
+problem, not a pairing problem. Set `DEBUG_LINK = False` once linking works on
+real hardware.
