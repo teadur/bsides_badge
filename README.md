@@ -267,3 +267,11 @@ unplugged, both badges show "Link lost" and resume the same game when it is
 plugged back in. If one badge leaves and reopens the game, a returning guest
 gets the board back, while a returning host starts a fresh game. Pong traffic
 on the other end is ignored, so both badges must run the same game.
+
+Every message is also broadcast over ESP-NOW at the same time as the cable, so
+two badges in Wi-Fi range can play with no cable at all, and a badge whose
+espnow bring-up fails (older firmware, radio issue) transparently falls back
+to cable-only play. Both links run together rather than one being chosen over
+the other: whichever one is up carries the game, and since every message is
+guarded by the current game number, the same message arriving twice (once per
+link) is ignored rather than double-applied.

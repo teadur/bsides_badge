@@ -96,6 +96,44 @@ class FakeUart:
         self.closed = True
 
 
+class FakeEspNow:
+    """One badge's broadcast ESP-NOW radio. Messages sent here arrive in
+    .peer's inbox, unless the radio is inactive or has no peer in range."""
+
+    def __init__(self, *_args, **_kwargs):
+        self.active_ = False
+        self.peers = set()
+        self.inbox = []
+        self.peer = None
+        self.sent = []
+
+    def active(self, value=None):
+        if value is None:
+            return self.active_
+        self.active_ = value
+
+    def add_peer(self, mac):
+        self.peers.add(mac)
+
+    def send(self, mac, msg):
+        self.sent.append(msg)
+        if self.peer is not None and self.active_ and self.peer.active_:
+            self.peer.inbox.append((b"\x11" * 6, bytes(msg)))
+
+    def recv(self, _timeout_ms=0):
+        if self.inbox:
+            return self.inbox.pop(0)
+        return (None, None)
+
+
+class FakeWLAN:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def active(self, _value=None):
+        return True
+
+
 async def _sleep_ms(_ms):
     return None
 
@@ -113,6 +151,15 @@ def _install_stubs():
     machine.UART = FakeUart
     machine.Pin = lambda *args, **kwargs: None
     sys.modules["machine"] = machine
+
+    network = types.ModuleType("network")
+    network.WLAN = FakeWLAN
+    network.STA_IF = 0
+    sys.modules["network"] = network
+
+    espnow_module = types.ModuleType("espnow")
+    espnow_module.ESPNow = FakeEspNow
+    sys.modules["espnow"] = espnow_module
 
     uasyncio = types.ModuleType("uasyncio")
     uasyncio.create_task = lambda coro: (coro.close(), _Task())[1]
@@ -150,11 +197,15 @@ def wire(a, b):
     a.uart.peer, b.uart.peer = b.uart, a.uart
 
 
+def wire_espnow(a, b):
+    a.espnow.peer, b.espnow.peer = b.espnow, a.espnow
+
+
 def pump(games, ms=600):
     for _ in range(ms // ttt.TICK_MS):
         _Clock.now += ttt.TICK_MS
         for g in games:
-            g._poll_uart()
+            g._poll_links()
             g._tick(_Clock.now)
 
 
@@ -364,6 +415,60 @@ class LinkedGameTests(unittest.TestCase):
         self.assertEqual(press(self.host, BTN_BACK), "games")
         self.assertFalse(self.host.running)
         self.assertTrue(self.host.uart.closed)
+        self.assertFalse(self.host.espnow.active_)
+
+
+class EspNowLinkTests(unittest.TestCase):
+    """Same protocol, but with no cable at all: only the broadcast ESP-NOW
+    radios are wired together."""
+
+    def setUp(self):
+        random.seed(3)
+        _Clock.now = 100000
+        self.host = make(HIGH_ID)
+        self.guest = make(LOW_ID)
+        wire_espnow(self.host, self.guest)
+        self.both = [self.host, self.guest]
+        pump(self.both)
+
+    def test_links_and_plays_without_a_cable(self):
+        h, g = self.host, self.guest
+        self.assertEqual((h.phase, g.phase), ("play", "play"))
+        self.assertTrue(h.is_host)
+        play_cell(h, 4, [g])
+        play_cell(g, 0, [h])
+        self.assertEqual(h.board, g.board)
+        self.assertEqual(h.board[4], "X")
+        self.assertEqual(h.board[0], "O")
+
+    def test_falls_back_to_uart_when_espnow_is_unavailable(self):
+        """No espnow module (older firmware, no Wi-Fi radio, ...) -> the
+        cable-only path from before this feature still works unmodified."""
+        with patch.object(ttt, "espnow", None):
+            h, g = make(HIGH_ID), make(LOW_ID)
+        self.assertIsNone(h.espnow)
+        self.assertIsNone(g.espnow)
+        wire(h, g)
+        pump([h, g])
+        self.assertEqual((h.phase, g.phase), ("play", "play"))
+        play_cell(h, 4, [g])
+        self.assertEqual(g.board[4], "X")
+
+    def test_duplicate_delivery_over_both_links_does_not_desync(self):
+        """A cable plugged in alongside a working Wi-Fi link delivers every
+        message twice; the game number guard must absorb that without
+        double-advancing a new game or double-counting a move."""
+        h, g = self.host, self.guest
+        wire(h, g)                          # cable now also connects them
+        for who, cell in ((h, 0), (g, 3), (h, 1), (g, 4), (h, 2)):
+            play_cell(who, cell, [h if who is g else g])
+        first_game = h.game_no
+        self.assertEqual(ttt.winner(h.board), ("X", (0, 1, 2)))
+        press(g, BTN_SELECT)                # guest asks for a rematch
+        pump(self.both)
+        self.assertEqual(h.game_no, first_game + 1)
+        self.assertEqual(h.board, ["-"] * 9)
+        self.assertEqual(h.board, g.board)
 
 
 class LonelyBadgeTests(unittest.TestCase):

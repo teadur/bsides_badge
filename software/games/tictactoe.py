@@ -5,6 +5,13 @@ import uasyncio as asyncio
 
 import bsides
 
+try:
+    import network
+    import espnow
+except ImportError:
+    network = None
+    espnow = None
+
 
 GAME_NAME = "Tic-tac-toe"
 
@@ -14,6 +21,13 @@ UART_ID = 1
 UART_RX = 20
 UART_TX = 21
 UART_BAUD = 115200
+
+# Cable-free fallback: broadcast every message over ESP-NOW as well, so two
+# badges out of cable reach (or with no cable at all) can still find each
+# other. Both links carry the same framed messages and run at the same time;
+# whichever one gets a frame through feeds the same handler, so a badge with
+# no Wi-Fi support (or a broken cable) still works over whichever link is up.
+ESPNOW_BROADCAST = b"\xff\xff\xff\xff\xff\xff"
 
 BTN_NEXT = bsides.BTN_NEXT
 BTN_PREV = bsides.BTN_PREV
@@ -81,11 +95,15 @@ def decode(line):
 
 class TicTacToeScreen:
     """
-    Two-player tic-tac-toe over the UART link (same cable as Pong).
-    The badge with the higher device ID becomes host: it owns the board and
-    plays X. The host rebroadcasts the full game state as a heartbeat, and the
-    guest repeats its pending move until the board shows it, so dropped or
-    corrupted lines never desynchronise the game. The starter alternates.
+    Two-player tic-tac-toe over the UART cable (same as Pong) and, at the same
+    time, over broadcast ESP-NOW, so a working Wi-Fi radio lets two badges
+    play without the cable. The badge with the higher device ID becomes host:
+    it owns the board and plays X. The host rebroadcasts the full game state
+    as a heartbeat, and the guest repeats its pending move until the board
+    shows it, so dropped or corrupted lines never desynchronise the game -
+    and, since every message is idempotent against the current game number,
+    neither does the same message arriving twice over both links. The starter
+    alternates.
     Controls:
       NEXT/PREV -> move cursor to the next/previous empty cell
       SELECT    -> place mark on your turn / new game when finished /
@@ -103,6 +121,7 @@ class TicTacToeScreen:
         self.uart = machine.UART(UART_ID, baudrate=UART_BAUD,
                                  tx=machine.Pin(UART_TX),
                                  rx=machine.Pin(UART_RX), timeout=0)
+        self.espnow = self._init_espnow()
 
         self.running = True
         self.peer_id = None
@@ -119,6 +138,23 @@ class TicTacToeScreen:
         self._tasks = [asyncio.create_task(self._loop()),
                        asyncio.create_task(self._rx())]
         self.render()
+
+    def _init_espnow(self):
+        """Bring up broadcast ESP-NOW, or return None on any failure.
+
+        A None here just means this badge falls back to the cable: whatever
+        firmware or hardware issue caused it (no espnow module, no Wi-Fi
+        radio, driver error) isn't ours to diagnose mid-game."""
+        if espnow is None:
+            return None
+        try:
+            network.WLAN(network.STA_IF).active(True)
+            link = espnow.ESPNow()
+            link.active(True)
+            link.add_peer(ESPNOW_BROADCAST)
+            return link
+        except Exception:
+            return None
 
     # ---------- state helpers ----------
     def _clear_game(self):
@@ -179,7 +215,13 @@ class TicTacToeScreen:
 
     # ---------- link ----------
     def _send(self, payload):
-        self.uart.write(encode(payload) + b"\n")
+        frame = encode(payload)
+        self.uart.write(frame + b"\n")
+        if self.espnow is not None:
+            try:
+                self.espnow.send(ESPNOW_BROADCAST, frame)
+            except OSError:
+                pass
 
     def _send_hello(self, need):
         self._send(("H%s,%d,%d" % (self.my_id, 1 if need else 0,
@@ -337,6 +379,24 @@ class TicTacToeScreen:
         if len(self._buf) > 200:
             self._buf = self._buf[-64:]
 
+    def _poll_espnow(self):
+        if self.espnow is None:
+            return
+        # Every ESP-NOW datagram is one already-framed message (no newline
+        # splitting needed), so drain whatever arrived since the last poll.
+        while True:
+            try:
+                _mac, msg = self.espnow.recv(0)
+            except OSError:
+                return
+            if msg is None:
+                return
+            self._handle_line(msg)
+
+    def _poll_links(self):
+        self._poll_uart()
+        self._poll_espnow()
+
     # ---------- loops ----------
     def _tick(self, now):
         self.tick += 1
@@ -377,7 +437,7 @@ class TicTacToeScreen:
     async def _rx(self):
         try:
             while self.running:
-                self._poll_uart()
+                self._poll_links()
                 await asyncio.sleep_ms(10)
         except asyncio.CancelledError:
             return
@@ -391,6 +451,11 @@ class TicTacToeScreen:
             self.uart.deinit()
         except Exception:
             pass
+        if self.espnow is not None:
+            try:
+                self.espnow.active(False)
+            except Exception:
+                pass
 
     # ---------- drawing ----------
     def _center6(self, text, y):
