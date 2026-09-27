@@ -223,22 +223,29 @@ ports in `PORTS` (default `/dev/ttyACM0 /dev/ttyACM1`):
 make tools                            # install esptool, mpremote, mpy-cross
 make upload                           # upload to every badge, version detected
 make upload NO_COMPILE=1              # ...as .py sources instead of .mpy
-make badge-test                       # both Wi-Fi tests + logs + report
+make badge-test                       # every hardware test + logs + report
 make wifi-check                       # upload, then badge-test
 make logs                             # only save every badge's link log
 make logs CLEAR=1                     # ...and delete them on the badges
 make upload PORTS=/dev/ttyACM1 BADGE_VERSION=2026
 ```
 
-`badge-test` runs both Wi-Fi tic-tac-toe tests (see
-[Tic-tac-toe link](#tic-tac-toe-link)) on all badges at once: `wifi-test`,
-which starts the game directly, then `menu-test`, which opens it from the
-menu. It then saves each badge's link log and writes one report file,
-`badge-logs/report-<time>.txt`. The report starts with a PASS/FAIL line per
-badge and test, followed by every test output and link log from that run, so
-it is the only file to share. The logs and report are collected even when a
-test fails, and the command fails if either test did. `make report` rebuilds
-the report of the last run.
+`badge-test` runs every hardware test on all badges at once: the Wi-Fi and
+menu pairing tests for both link games (see [Tic-tac-toe
+link](#tic-tac-toe-link) and [Pong link](#pong-link)) - `wifi-test` and
+`pong-wifi-test` start the game directly, `menu-test` and `pong-menu-test`
+open it from the menu - and `solo-test`, which opens every single-player
+game from the menu on each badge in turn (see
+[Testing a game from the menu](#testing-a-game-from-the-menu)). The pairing
+tests need at least two ports in `PORTS`; with only one, `badge-test` skips
+them and runs `solo-test` alone. It then saves each badge's link log and
+writes one report file, `badge-logs/report-<time>.txt`. The report starts
+with a PASS/FAIL line per badge and test, followed by every test output and
+link log from that run, so it is the only file to share. The logs and
+report are collected even when a test fails, and the command fails if any
+test did. Run any one test by name (`make pong-menu-test`, `make
+solo-test`, ...); `make report` rebuilds the report of the last
+`badge-test` run.
 
 Run `python scripts/badge.py --help` or a subcommand with `--help` for all
 options. After a successful operation on a 2026 badge, the tool prints the
@@ -488,13 +495,28 @@ idea for Pong: it pairs the same way, then lets one full match play out and
 prints `PONG-WIFI <device ID>:` lines, failing if the link is ever reported
 lost during the match.
 
-That test starts the game without the menu, which leaves Wi-Fi much more
-memory than a player has. `tests/tictactoe_menu_hardware.py`, run the same
-way (`make menu-test`), starts the normal application instead, including the
-whole menu UI, and drives it with simulated button presses: **Games ->
-Tic-tac-toe**, the invitation through the lobby, the same scripted game over
-Wi-Fi only, then BACK. It prints
-`MENU-TEST <device ID>:` lines ending in `PASS` or `FAIL: <reason>`, including
-free memory in the games menu and after leaving the game, and writes them to
-the link log. When it ends, the badge is left at the MicroPython prompt; the
-next `make logs` (or a reset) starts the application again.
+### Testing a game from the menu
+
+The two tests above start their game directly, without the menu, which
+leaves Wi-Fi much more memory than a player actually has -
+`tests/tictactoe_menu_hardware.py` (`make menu-test`) and
+`tests/pong_menu_hardware.py` (`make pong-menu-test`) instead start the
+normal application, including the whole menu UI, and drive it with
+simulated button presses: **Games -> Tic-tac-toe** or **Games -> Pong**,
+the invitation through the lobby, one game or match over Wi-Fi only, then
+BACK. They print `MENU-TEST <device ID>:` or `PONG-MENU <device ID>:` lines
+ending in `PASS` or `FAIL: <reason>`, including free memory in the games
+menu and after leaving the game, and write them to the link log. When a
+test ends, the badge is left at the MicroPython prompt; the next `make
+logs` (or a reset) starts the application again.
+
+`tests/singleplayer_menu_hardware.py` (`make solo-test`) does the same for
+every single-player game (Flappy Bird, Pacman, Snake, Tetris) on one badge:
+no pairing, so no second badge is needed. It opens each game from the menu
+in turn, presses a handful of its own buttons to make sure it answers
+input, then BACK, twice over to let each game's one-time costs (module
+caches, interned strings) settle, and once more to check that a further
+visit does not cost any more memory - a regression of the same bug
+`game_loader` and precompiling were written to fix (see [WiFi
+neighbours](#wifi-neighbours)), just for any game rather than only the ones
+that touch Wi-Fi. It prints `SOLO-TEST <device ID>:` lines the same way.
