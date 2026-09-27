@@ -17,7 +17,7 @@ GAME_NAME = "Tic-tac-toe"
 # cable and the radio to linklog (serial console, Utils -> WiFi neighbours,
 # and /linklog.txt). Pairing and ESP-NOW errors are logged either way. Flip
 # to False once linking is confirmed working on real hardware.
-DEBUG_LINK = True
+DEBUG_LINK = False
 
 BTN_NEXT = bsides.BTN_NEXT
 BTN_PREV = bsides.BTN_PREV

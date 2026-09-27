@@ -19,7 +19,7 @@ GAME_NAME = "Pong"
 # Debug flag: log phase changes and raw traffic on both the cable and the
 # radio to linklog (serial console, Utils -> WiFi neighbours, and
 # /linklog.txt). Pairing and ESP-NOW errors are logged either way.
-DEBUG_LINK = True
+DEBUG_LINK = False
 
 BTN_NEXT = bsides.BTN_NEXT
 BTN_PREV = bsides.BTN_PREV

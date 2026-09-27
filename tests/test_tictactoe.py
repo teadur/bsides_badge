@@ -357,11 +357,15 @@ class EspNowLinkTests(unittest.TestCase):
     def setUp(self):
         random.seed(3)
         _Clock.now = 100000
-        self.host = make(HIGH_ID)
-        self.guest = make(LOW_ID)
-        wire_espnow(self.host, self.guest)
-        self.both = [self.host, self.guest]
-        pair_radio(self.guest, self.host)
+        # DEBUG_LINK defaults to off; one test below checks the debug
+        # logging still works (phase changes, traffic) when it is on -
+        # covering pairing too, so it has to wrap the whole setUp.
+        with patch.object(ttt, "DEBUG_LINK", True):
+            self.host = make(HIGH_ID)
+            self.guest = make(LOW_ID)
+            wire_espnow(self.host, self.guest)
+            self.both = [self.host, self.guest]
+            pair_radio(self.guest, self.host)
 
     def test_links_and_plays_without_a_cable(self):
         h, g = self.host, self.guest

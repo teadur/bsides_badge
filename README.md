@@ -319,7 +319,7 @@ games. The Wi-Fi driver's memory is reserved once at boot, before the menu
 loads: its buffers live outside the Python heap, and the heap grows into that
 space as the menu and games load, so starting Wi-Fi for the first time inside
 a game could fail with `WiFi Out of Memory`. The radio stays off until
-Tic-tac-toe or WiFi neighbours turns it on.
+Pong, Tic-tac-toe, or WiFi neighbours turns it on.
 
 `GameScreen(oled)` must provide `render()` and async `handle_button(btn)`
 methods. Set `manages_own_render = True` when the game owns an animation loop.
@@ -466,15 +466,16 @@ or cable line. The bodies are:
 The Wi-Fi side is a proof of concept. No badge joins an access point, so both
 radios are set to a fixed channel (`CHANNEL` in `software/espnow_link.py`,
 currently channel 1); otherwise ESP-NOW has nothing that makes the two
-badges use the same channel. While `DEBUG_LINK` in `tictactoe.py` is on (the
-default for now), the game adds phase changes, hello contents, and every
-frame sent or received on both the cable and the radio to the
-[link log](#wifi-neighbours). ESP-NOW start-up and errors are always logged.
-After a failed pairing, open **Utils -> WiFi neighbours** and press SELECT to
-see the log on the badge, or save it with `python scripts/badge.py logs`. A
-badge whose log has no `espnow up ch 1 mac ...` line has a radio or firmware
-problem, not a pairing problem. Set `DEBUG_LINK = False` in `tictactoe.py` or
-`pong.py` once linking works on real hardware.
+badges use the same channel. Pairing, session and MAC-address filtering, and
+ESP-NOW start-up and errors are always logged. Set `DEBUG_LINK = True` in
+`tictactoe.py` or `pong.py` to add phase changes and every frame sent or
+received on both the cable and the radio to the
+[link log](#wifi-neighbours) too - worth turning on when chasing a link
+problem, off (the default) otherwise, since it logs several lines a second
+once two badges are playing. After a failed pairing, open **Utils -> WiFi
+neighbours** and press SELECT to see the log on the badge, or save it with
+`python scripts/badge.py logs`. A badge whose log has no `espnow up ch 1
+mac ...` line has a radio or firmware problem, not a pairing problem.
 
 To test the Wi-Fi link on two uploaded badges without the cable, run the
 scripted game on both at the same time (replace the ports with yours):
